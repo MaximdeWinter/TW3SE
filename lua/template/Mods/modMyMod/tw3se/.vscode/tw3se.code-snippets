@@ -1,0 +1,64 @@
+{
+  "TW3SE mod settings": {
+    "scope": "lua",
+    "prefix": "w3mod",
+    "body": [
+      "local cfg = w3.mod{",
+      "  name = \"${1:My Mod}\", version = \"1.0\", author = \"${2:you}\", tw3se = \"1.2.0\",",
+      "  description = \"${3:What it does.}\",",
+      "  settings = {",
+      "    {key = \"enabled\", default = true, label = \"Enabled\"},",
+      "    {key = \"${4:amount}\", type = \"slider\", min = ${5:0}, max = ${6:100}, int = true, default = ${7:50}, label = \"${8:Amount}\"},",
+      "  },",
+      "}",
+      "$0"
+    ],
+    "description": "w3.mod with two settings (the TW3SE Menu and the game's Options > Mods)"
+  },
+  "TW3SE game event": {
+    "scope": "lua",
+    "prefix": "w3on",
+    "body": [
+      "w3.on(\"${1|death,hit,item_added,item_removed,consume,level_up,sign,combat_start,combat_end,fact,spawn,scene_start,scene_end,quest,world,hour,load,save|}\", function(e)",
+      "  $0",
+      "end)"
+    ],
+    "description": "w3.on: a function each time the event happens"
+  },
+  "TW3SE key": {
+    "scope": "lua",
+    "prefix": "w3key",
+    "body": ["w3.on_key(\"${1:F7}\", function()", "  $0", "end)"],
+    "description": "w3.on_key: a function each time the key goes down (\"Pad_LB+Pad_Y\" for a controller)"
+  },
+  "TW3SE hook": {
+    "scope": "lua",
+    "prefix": "w3hook",
+    "body": [
+      "w3.hook(\"${1:W3PlayerWitcher}\", \"${2:GetMaxHealth}\", function(self, args, orig)",
+      "  local r = orig()",
+      "  $0",
+      "  return r",
+      "end)"
+    ],
+    "description": "w3.hook: change what a function of the game does"
+  },
+  "TW3SE every tick": {
+    "scope": "lua",
+    "prefix": "w3tick",
+    "body": ["w3.on_tick(function()", "  local p = w3.player()", "  if not p then return end", "  $0", "end)"],
+    "description": "w3.on_tick: a function every game tick"
+  },
+  "TW3SE ask": {
+    "scope": "lua",
+    "prefix": "w3ask",
+    "body": ["w3.hud.ask(\"${1:Are you sure?}\", function(yes)", "  if yes then", "    $0", "  end", "end)"],
+    "description": "w3.hud.ask: the game's own Yes/No window"
+  },
+  "TW3SE draw over the game": {
+    "scope": "lua",
+    "prefix": "w3draw",
+    "body": ["w3.on_draw(function()", "  w3.draw.rect(20, 20, 240, 40, 0x202020C0)", "  w3.draw.text(32, 28, 0xFFFFFFFF, ${1:\"Hello\"})", "end)"],
+    "description": "w3.on_draw: text and boxes over the game"
+  }
+}

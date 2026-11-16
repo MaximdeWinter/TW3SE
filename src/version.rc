@@ -1,0 +1,54 @@
+// Name, maker and version in each DLL's properties (a DLL without them, dinput8.dll above all, looks like malware
+// to the virus scanners Nexus asks). build.bat compiles it once per DLL with /d TW3SE_FILE=1..6.
+#include <winver.h>
+#include "tw3se/tw3se.h"
+
+#define STR2(x) #x
+#define STR(x) STR2(x)
+#define TW3SE_VERSION_STR STR(TW3SE_VERSION_MAJOR) "." STR(TW3SE_VERSION_MINOR) "." STR(TW3SE_VERSION_PATCH)
+
+#if TW3SE_FILE == 1
+#define FILE_DESC "TW3SE loader (The Witcher 3 Script Extender)"
+#define FILE_NAME "dinput8.dll"
+#elif TW3SE_FILE == 2
+#define FILE_DESC "TW3SE - The Witcher 3 Script Extender"
+#define FILE_NAME "tw3se.dll"
+#elif TW3SE_FILE == 3
+#define FILE_DESC "TW3SE example plugin"
+#define FILE_NAME "example.dll"
+#elif TW3SE_FILE == 5
+#define FILE_DESC "TW3SE: Witcher Native Bridge API for mods made for it (forwards to tw3se.dll)"
+#define FILE_NAME "WitcherNativeBridge.asi"
+#elif TW3SE_FILE == 6
+#define FILE_DESC "TW3SE starter for ASI loaders (The Witcher 3 Script Extender)"
+#define FILE_NAME "!tw3se.asi"
+#else
+#define FILE_DESC "TW3SE plugin template"
+#define FILE_NAME "template.dll"
+#endif
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION TW3SE_VERSION_MAJOR, TW3SE_VERSION_MINOR, TW3SE_VERSION_PATCH, 0
+PRODUCTVERSION TW3SE_VERSION_MAJOR, TW3SE_VERSION_MINOR, TW3SE_VERSION_PATCH, 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_DLL
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "MaximdeWinter"
+            VALUE "FileDescription", FILE_DESC
+            VALUE "FileVersion", TW3SE_VERSION_STR
+            VALUE "InternalName", FILE_NAME
+            VALUE "LegalCopyright", "MaximdeWinter"
+            VALUE "OriginalFilename", FILE_NAME
+            VALUE "ProductName", "TW3SE - The Witcher 3 Script Extender"
+            VALUE "ProductVersion", TW3SE_VERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

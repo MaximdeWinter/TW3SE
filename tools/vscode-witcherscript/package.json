@@ -1,0 +1,48 @@
+{
+  "name": "tw3se-witcherscript-debug",
+  "displayName": "WitcherScript and Lua Debugger (TW3SE)",
+  "description": "Breakpoints, steps and variables for WitcherScript and TW3SE Lua in The Witcher 3",
+  "version": "1.0.0",
+  "publisher": "tw3se",
+  "license": "MIT",
+  "engines": { "vscode": "^1.80.0" },
+  "categories": ["Debuggers"],
+  "main": "./extension.js",
+  "activationEvents": ["onDebug"],
+  "contributes": {
+    "languages": [
+      { "id": "witcherscript", "aliases": ["WitcherScript"], "extensions": [".ws"] }
+    ],
+    "breakpoints": [{ "language": "witcherscript" }, { "language": "lua" }],
+    "debuggers": [
+      {
+        "type": "witcherscript",
+        "label": "WitcherScript (TW3SE)",
+        "languages": ["witcherscript", "lua"],
+        "configurationAttributes": {
+          "attach": {
+            "properties": {
+              "port": { "type": "number", "default": 29170, "description": "debugger_port in tw3se.config" },
+              "host": { "type": "string", "default": "127.0.0.1" },
+              "scriptRoots": {
+                "type": "array",
+                "items": { "type": "string" },
+                "default": [],
+                "description": "Folders with your scripts (searched before the game's)"
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          { "type": "witcherscript", "request": "attach", "name": "Attach to The Witcher 3", "port": 29170 }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "WitcherScript: Attach to The Witcher 3",
+            "body": { "type": "witcherscript", "request": "attach", "name": "Attach to The Witcher 3", "port": 29170 }
+          }
+        ]
+      }
+    ]
+  }
+}
