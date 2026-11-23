@@ -418,10 +418,44 @@ void SessionExit(long code, bool terminate) {
     Append(text, static_cast<size_t>(n));
 }
 
+// The marker's notes (the faults the game's crash handler got, with their callers) go into tw3se.log as well, once,
+// at an end that was not normal. Players post the crashed session's log right away; crash_report.txt only comes at
+// the next start (22.11.: a log ended in "NtTerminateProcess, code 0x80000003" and nothing said where).
+// A stack buffer: the heap may be what broke.
+void SessionNotesToLog() {
+    static volatile LONG once = 0;
+    if (!g_marker[0] || InterlockedExchange(&once, 1)) return;
+    HANDLE h = CreateFileW(g_marker, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0,
+                           nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    char buf[16384];
+    DWORD n = 0;
+    if (!ReadFile(h, buf, sizeof buf - 1, &n, nullptr)) n = 0;
+    CloseHandle(h);
+    buf[n] = 0;
+    char* line = strchr(buf, '\n');  // the first line is the start ("started ..."), already at the log's top
+    while (line) {
+        ++line;
+        char* next = strchr(line, '\n');
+        if (next) *next = 0;
+        size_t len = strlen(line);
+        if (len && line[len - 1] == '\r') line[--len] = 0;
+        if (len) Log("session: %s", line);
+        line = next;
+    }
+    Log("crash report: tw3se\\out\\crash_report.txt is written at the next start of the game");
+}
+
 void SessionFault(EXCEPTION_POINTERS* ep) {
     if (!g_marker[0] || !ep || !ep->ExceptionRecord) return;
     const char* what = FaultText(ep->ExceptionRecord->ExceptionCode);
-    if (!what || InterlockedIncrement(&g_faults) > 3) return;
+    // one exception passes each covered handler (the game has more than one): it is noted once
+    // (the record's place and the fault's address: a later fault may get a record at the same stack place)
+    static void* volatile s_last = nullptr;
+    void* key = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(ep->ExceptionRecord) ^
+                                        (reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress) << 1));
+    if (!what || InterlockedExchangePointer(&s_last, key) == key) return;
+    if (InterlockedIncrement(&g_faults) > 3) return;
     uintptr_t at = reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress);
     HMODULE m = nullptr;
     char mod[MAX_PATH] = "?";

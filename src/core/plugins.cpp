@@ -507,9 +507,37 @@ int ApiSkinHookOverlay(int slot, const void* rgba8, int size) {
     ApiSetError(err.c_str());
     return 0;
 }
+void* ApiEngineAddress(const char* name) {
+    if (!name) return nullptr;
+    std::string err;
+    uintptr_t a = EngineResolve(name, &err);
+    if (!a) ApiSetError(err.c_str());
+    return reinterpret_cast<void*>(a);
+}
+void* ApiEngineVtable(const char* className, uint32_t offset) {
+    return className ? reinterpret_cast<void*>(EngineVtable(className, offset)) : nullptr;
+}
 int ApiSkinHookOverlayMaterial(int slot, const void* rgba8, int size) {
     std::string err;
     if (SkinHookOverlayPlane(slot, 1, rgba8, size, &err)) return 1;
+    ApiSetError(err.c_str());
+    return 0;
+}
+int ApiSkinHookOverlayRegion(int slot, int plane, const void* rgba8, int size, int base) {
+    std::string err;
+    if (SkinHookOverlayRegion(slot, plane, rgba8, size, base, &err)) return 1;
+    ApiSetError(err.c_str());
+    return 0;
+}
+int ApiSkinHookChunkSlot(int slot, int chunk) {
+    std::string err;
+    const int s = SkinHookChunkSlot(slot, chunk, &err);
+    if (!s) ApiSetError(err.c_str());
+    return s;
+}
+int ApiSkinHookDqs(int slot, int on) {
+    std::string err;
+    if (SkinHookDqs(slot, on != 0, &err)) return 1;
     ApiSetError(err.c_str());
     return 0;
 }
@@ -700,6 +728,11 @@ TW3SE_Interface g_api = {
     &ApiSkinHookMushMask,
     &ApiSkinHookOverlay,
     &ApiSkinHookOverlayMaterial,
+    &ApiEngineAddress,
+    &ApiEngineVtable,
+    &ApiSkinHookDqs,
+    &ApiSkinHookOverlayRegion,
+    &ApiSkinHookChunkSlot,
 };
 
 using Query_t = int (*)(TW3SE_PluginInfo*);

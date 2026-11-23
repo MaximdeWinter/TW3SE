@@ -37,6 +37,7 @@ void NTAPI ExitHook(LONG code) {
     snprintf(why, sizeof why, "process exit, code %ld", code);
     LogStack(why);
     SessionExit(code, false);
+    SessionNotesToLog();  // nothing after a normal end (the marker is gone)
     oRtlExitUserProcess(code);
 }
 
@@ -47,6 +48,7 @@ BOOL WINAPI TerminateHook(HANDLE p, UINT code) {
         snprintf(why, sizeof why, "TerminateProcess(self), code %u", code);
         LogStack(why);
         SessionExit(static_cast<long>(code), true);
+        SessionNotesToLog();
     }
     return oTerminateProcess(p, code);
 }
@@ -74,6 +76,7 @@ void WINAPI FailFastHook(PEXCEPTION_RECORD rec, PCONTEXT ctx, DWORD flags) {
              rec ? static_cast<unsigned long>(rec->ExceptionCode) : 0ul, from);
     SessionNote(line);
     LogStack(line);
+    SessionNotesToLog();
     oRaiseFailFast(rec, ctx, flags);
 }
 
@@ -89,6 +92,7 @@ LONG NTAPI NtTerminateHook(HANDLE p, LONG code) {
                  static_cast<unsigned long>(code), from);
         SessionNote(line);
         LogStack(line);
+        SessionNotesToLog();
     }
     return oNtTerminate(p, code);
 }

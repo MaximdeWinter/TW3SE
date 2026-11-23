@@ -853,7 +853,7 @@ for the game's build). The DLL and the shaders go in together; a mismatch stands
 - `SkinHookCapsulesEx` takes up to 32 capsules of 12 floats: a.xyz, radius, b.xyz, strength, falloff, mode, 0, 0
   (model space, metres). Mode 0 or more pushes the skin out; with a falloff the edge of the dent is soft. A mode below
   0 draws the skin that lies within the falloff outside the capsule onto it. The skin's normal turns with the dent,
-  so the light shows it (shaders of `skin_build.py` from 15.11.2026 on). The meshes of one figure are skinned in
+  so the light shows it (shaders of `skin_build.py` of TW3SE 1.3.4 or later). The meshes of one figure are skinned in
   one model space: give the same capsules to two slots and one mesh presses on the other.
 - `SkinHookDeltaMush` smooths the skinned mesh (`iterations` steps over its triangles; 8 is a good start, 0 turns it
   off) and puts its rest detail back on the smoothed surface, so a joint that bends keeps its volume. It is one frame
@@ -868,10 +868,39 @@ for the game's build). The DLL and the shaders go in together; a mismatch stands
   game's own rain look (glossy, the colour deeper). G makes it matte, for dried spots. B is a height: where it rises
   or falls the normal tilts, so the edge of a thick drop catches the light (B = 255 stands 16 texels high). A is
   unused. A size other than the colour's clears the colour, and the other way round. It needs the shaders of
-  `skin_build.py` from 15.11.2026 on (`overlay 2` in `skinhook.txt`).
+  `skin_build.py` of TW3SE 1.3.4 or later (`overlay 2` in `skinhook.txt`).
 
 Lua: `w3.skinhook.capsules(slot, {{a = {x, y, z}, b = {x, y, z}, radius = r, strength = s, falloff = k, inward =
 true}})`, `w3.skinhook.mush(slot, n)`, `w3.skinhook.mush_mask(slot, chunk, {...})`.
 `w3.skinhook.overlay(slot, size, colour, material)` sets both pictures from two strings of 4 x size x size bytes
 (nil clears one). `w3.skinhook.capture(slot, path)` writes the skinned positions of the slot's mesh a few frames later (with ray
 tracing on).
+
+## Dual quaternion skinning (interface 28)
+
+```c
+int SkinHookDqs(int slot, int on);
+```
+
+`SkinHookDqs(slot, 1)` skins the slot's mesh with dual quaternions in place of the game's linear blend. The bones and
+the weights stay the same. A joint that bends far (a hip at 130 degrees, an elbow, a twisted wrist) keeps its volume,
+where the linear blend lets the skin fall in. The scale of a bone (breasts, `w3.anim.shape`) works as in the game.
+The normals turn with it, so the light falls right in a fold. Delta Mush and the capsules work on top of it.
+`SkinHookDqs(slot, 0)` gives the game's skinning back.
+
+Each bone is blended from the side of its rest pose, the same for every vertex, so neighbouring vertices stay together. A bone turned half a turn or more away from its rest pose can make the blend jump there.
+
+It needs the shaders of `skin_build.py` of TW3SE 1.4.0 or later (`dqs 1` in `skinhook.txt`). Lua:
+`w3.skinhook.dqs(slot, true)`.
+
+## Engine functions by name (interface 27)
+
+```c
+void* fn = api->EngineAddress("CEntity::vf140");     // NULL if there is none; LastError says why
+void* vt = api->EngineVtable("CEntity", 0);          // the class's vtable
+```
+
+`EngineAddress` takes a name of the address list (as `GetAddress`), a slot of a class's vtable (`"CEntity::vf140"`,
+`"CEntity::vf0@10"` for the vtable at offset 0x10 of the object) or an offset in witcher3.exe (`"0x2263570"`). A slot
+is found by the class's name in the exe, so it holds after a patch as long as the class keeps its slots.
+`EngineVtable` gives the vtable itself. `tools/enginemap.py class <Name>` lists a class's slots.

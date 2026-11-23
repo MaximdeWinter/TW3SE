@@ -174,6 +174,12 @@ std::string ReloadLooseFile(const char* path) {
     for (char& c : p) c = c == '/' ? '\\' : c;
     std::wstring full = Dir() + L"\\files\\" + std::wstring(p.begin(), p.end());
     if (!ReadAll(full, bytes)) return "no file tw3se\\files\\" + p;
+    if (!FindDiskFile(p.c_str())) {
+        // a file the game does not have: a new one in the depot, read from memory (its bundle bytes never are)
+        std::string err = NewDiskFile(p.c_str());
+        if (err.rfind("no folder", 0) == 0) return "new, in a folder the game does not have - in the game from the next start";
+        if (!err.empty()) return err;
+    }
     return SetFileContents(p.c_str(), std::move(bytes), true);
 }
 
@@ -238,6 +244,19 @@ std::string FileAlias(const char* src, const char* dst) {
     }
     Log("reload: %s is an alias of %s", d.c_str(), src);
     return "";
+}
+
+// A file the game does not have, added while it runs: an alias of a small bundled file, its contents from memory.
+std::string NewDiskFile(const char* path) {
+    static const char* const kAny[] = {"gameplay\\items\\def_item_junk.xml", "gameplay\\items\\def_item_misc.xml"};
+    std::string err;
+    for (const char* src : kAny) {
+        if (!FindDiskFile(src)) continue;
+        err = FileAlias(src, path);
+        if (err.empty()) Log("reload: %s is new in the depot", path);
+        return err;
+    }
+    return "no bundled file to start a new one from";
 }
 
 namespace {

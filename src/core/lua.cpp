@@ -2972,8 +2972,9 @@ void EngPre(int slot, uint64_t* regs, const uint64_t* stack) {
 int LEngineHook(lua_State* L) {
     std::string name = luaL_checkstring(L, 1);
     luaL_checktype(L, 2, LUA_TFUNCTION);
-    void* target = reinterpret_cast<void*>(Address(name.c_str()));
-    if (!target) return luaL_error(L, "w3.engine_hook: %s is not in TW3SE's address list for this game build", name.c_str());
+    std::string why;
+    void* target = reinterpret_cast<void*>(EngineResolve(name, &why));
+    if (!target) return luaL_error(L, "w3.engine_hook: %s", why.c_str());
     int slot = -1;
     for (int i = 0; i < kEngSlots && slot < 0; ++i)
         if (g_eng[i].target == target) slot = i;
@@ -3007,6 +3008,197 @@ bool EngUnhookId(lua_State* L, int id) {
 int LEngineUnhook(lua_State* L) {
     lua_pushboolean(L, EngUnhookId(L, static_cast<int>(luaL_checkinteger(L, 1))));
     return 1;
+}
+
+// w3.mem: memory for w3.engine_call's out values and structs. alloc(n) -> address (zeroed, the engine's allocator, so
+// the game may keep it), read(address, n) -> string (nil if unreadable), write(address, string), free(address).
+int LMemAlloc(lua_State* L) {
+    lua_Integer n = luaL_checkinteger(L, 1);
+    if (n <= 0 || n > (1 << 30)) return luaL_error(L, "w3.mem.alloc: 1 to 1 GB");
+    void* p = EngineAlloc(static_cast<size_t>(n), 16);
+    if (!p) return luaL_error(L, "w3.mem.alloc: no engine memory");
+    memset(p, 0, static_cast<size_t>(n));
+    lua_pushinteger(L, static_cast<lua_Integer>(reinterpret_cast<uintptr_t>(p)));
+    return 1;
+}
+int LMemRead(lua_State* L) {
+    auto p = reinterpret_cast<const void*>(static_cast<uintptr_t>(luaL_checkinteger(L, 1)));
+    lua_Integer n = luaL_checkinteger(L, 2);
+    if (n < 0 || n > (1 << 30)) return luaL_error(L, "w3.mem.read: 0 to 1 GB");
+    std::string s(static_cast<size_t>(n), '\0');
+    if (!SafeRead(p, s.data(), s.size())) {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_pushlstring(L, s.data(), s.size());
+    return 1;
+}
+int LMemWrite(lua_State* L) {
+    auto p = reinterpret_cast<void*>(static_cast<uintptr_t>(luaL_checkinteger(L, 1)));
+    size_t n = 0;
+    const char* s = luaL_checklstring(L, 2, &n);
+    lua_pushboolean(L, SafeWrite(p, s, n));
+    return 1;
+}
+int LMemFree(lua_State* L) {
+    auto p = reinterpret_cast<void*>(static_cast<uintptr_t>(luaL_checkinteger(L, 1)));
+    if (auto freeFn = Fn<void (*)(void*)>("Memory::Free")) freeFn(p);
+    return 0;
+}
+
+// w3.engine_addr(name) -> the function's offset in witcher3.exe, or nil and why (names as w3.engine_hook takes them)
+int LEngineAddr(lua_State* L) {
+    std::string why;
+    uintptr_t a = EngineResolve(luaL_checkstring(L, 1), &why);
+    if (!a) {
+        lua_pushnil(L);
+        lua_pushstring(L, why.c_str());
+        return 2;
+    }
+    lua_pushinteger(L, static_cast<lua_Integer>(a - ImageBase()));
+    return 1;
+}
+
+}  // namespace
+}  // namespace tw3se
+extern "C" uint64_t tw3se_engcall(void* fn, const uint64_t* regs, const uint64_t* stack, uint64_t nstack,
+                                  uint64_t* xmm0Out);  // enghook.asm
+namespace tw3se {
+namespace {
+
+int LObjectAt(lua_State* L);  // w3.object, below
+
+// The call itself, under a guard: a fault in the engine function ends the call (no C++ objects in here).
+bool EngCallGuarded(void* fn, const uint64_t* regs, const uint64_t* stack, uint64_t n, uint64_t* rax, uint64_t* xmm0,
+                    DWORD* code) {
+    __try {
+        *rax = tw3se_engcall(fn, regs, stack, n, xmm0);
+        return true;
+    } __except (*code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// w3.engine_call(fn, sig, ...) -> the result. fn: a name as w3.engine_hook takes it, or an offset in witcher3.exe
+// (an integer below the image's size, as w3.vslot and w3.engine_addr give it), or an address. sig: one letter an
+// argument, then '>' and the result's letter: i integer, p pointer (an integer, an object, nil = 0), s string (a
+// C string for the call's time), b boolean, f float, d double; result also o (an object at the address), v nothing.
+// "pf>i": a pointer and a float in, an integer out. Up to 16 arguments; by Windows x64 the first four go to rcx,
+// rdx, r8, r9 or, for f and d, xmm0-xmm3. Main thread only; a fault ends the call with an error.
+int LEngineCall(lua_State* L) {
+    if (!OnMainThread()) return luaL_error(L, "w3.engine_call: only on the main thread");
+    uintptr_t fn = 0;
+    if (lua_type(L, 1) == LUA_TSTRING) {
+        std::string why;
+        fn = EngineResolve(lua_tostring(L, 1), &why);
+        if (!fn) return luaL_error(L, "w3.engine_call: %s", why.c_str());
+    } else {
+        fn = static_cast<uintptr_t>(luaL_checkinteger(L, 1));
+        if (fn && fn < 0x10000000) fn += ImageBase();  // an offset in the exe
+    }
+    if (!fn) return luaL_error(L, "w3.engine_call: no function");
+    std::string sig = luaL_checkstring(L, 2);
+    size_t gt = sig.find('>');
+    std::string ins = sig.substr(0, gt);
+    char ret = gt == std::string::npos || gt + 1 >= sig.size() ? 'v' : sig[gt + 1];
+    if (ins.size() > 16) return luaL_error(L, "w3.engine_call: at most 16 arguments");
+    uint64_t regs[8] = {}, stack[12] = {};
+    std::vector<std::string> keep;  // the strings live until the call returns
+    keep.reserve(ins.size());
+    for (size_t k = 0; k < ins.size(); ++k) {
+        int idx = static_cast<int>(k) + 3;
+        uint64_t v = 0;
+        bool isFloat = false;
+        switch (ins[k]) {
+        case 'i':
+            v = static_cast<uint64_t>(luaL_checkinteger(L, idx));
+            break;
+        case 'b':
+            v = lua_toboolean(L, idx) ? 1 : 0;
+            break;
+        case 'p':
+            if (lua_isnoneornil(L, idx)) v = 0;
+            else if (Obj* o = static_cast<Obj*>(luaL_testudata(L, idx, kObj))) v = reinterpret_cast<uint64_t>(o->ptr);
+            else v = static_cast<uint64_t>(luaL_checkinteger(L, idx));
+            break;
+        case 's': {  // the whole string with its length: packed structs hold zero bytes
+            size_t len = 0;
+            const char* p = luaL_checklstring(L, idx, &len);
+            keep.emplace_back(p, len);
+            v = reinterpret_cast<uint64_t>(keep.back().c_str());
+            break;
+        }
+        case 'f': {
+            float f = static_cast<float>(luaL_checknumber(L, idx));
+            uint32_t bits;
+            memcpy(&bits, &f, 4);
+            v = bits;
+            isFloat = true;
+            break;
+        }
+        case 'd': {
+            double d = luaL_checknumber(L, idx);
+            memcpy(&v, &d, 8);
+            isFloat = true;
+            break;
+        }
+        default:
+            return luaL_error(L, "w3.engine_call: argument %d: '%c' is no type (i p s b f d)", static_cast<int>(k) + 1,
+                              ins[k]);
+        }
+        if (k < 4) regs[isFloat ? 4 + k : k] = v;
+        else stack[k - 4] = v;
+    }
+    uint64_t rax = 0, xmm0 = 0;
+    DWORD code = 0;
+    if (!EngCallGuarded(reinterpret_cast<void*>(fn), regs, stack, ins.size() > 4 ? ins.size() - 4 : 0, &rax, &xmm0,
+                        &code)) {
+        char msg[160];
+        snprintf(msg, sizeof msg, "w3.engine_call: the function at witcher3.exe+0x%llx faulted (0x%08lx)",
+                 static_cast<unsigned long long>(fn - ImageBase()), code);
+        return luaL_error(L, "%s", msg);
+    }
+    switch (ret) {
+    case 'v':
+        return 0;
+    case 'b':
+        lua_pushboolean(L, (rax & 0xff) != 0);
+        return 1;
+    case 'f': {
+        float f;
+        uint32_t bits = static_cast<uint32_t>(xmm0);
+        memcpy(&f, &bits, 4);
+        lua_pushnumber(L, f);
+        return 1;
+    }
+    case 'd': {
+        double d;
+        memcpy(&d, &xmm0, 8);
+        lua_pushnumber(L, d);
+        return 1;
+    }
+    case 's':
+        if (!rax) lua_pushnil(L);
+        else {
+            char buf[1024] = {};
+            for (size_t n = 0; n + 1 < sizeof buf && SafeRead(reinterpret_cast<const char*>(rax) + n, buf + n, 1) && buf[n];)
+                ++n;
+            lua_pushstring(L, buf);
+        }
+        return 1;
+    case 'o':
+        if (!rax) {
+            lua_pushnil(L);
+            return 1;
+        }
+        lua_pushcfunction(L, LObjectAt);
+        lua_pushinteger(L, static_cast<lua_Integer>(rax));
+        lua_call(L, 1, 1);
+        return 1;
+    default:  // i, p
+        lua_pushinteger(L, static_cast<lua_Integer>(rax));
+        return 1;
+    }
 }
 int EngUnhookOwner(lua_State* L, const std::string& owner) {  // a Lua mod is taken out
     std::vector<int> ids;
@@ -4131,9 +4323,10 @@ int LFilesSet(lua_State* L) {  // w3._files_set(path, bytes): a game file's new 
     size_t n = 0;
     std::string p = luaL_checkstring(L, 1);
     const char* data = luaL_checklstring(L, 2, &n);
-    for (char& c : p) c = c == '/' ? '\\' : c;
+    for (char& c : p) c = c == '/' ? '\\' : static_cast<char>(tolower(static_cast<unsigned char>(c)));
     // (the loaded resource stays: what the world uses is freed by the engine at the next save load)
-    std::string err = SetFileContents(p.c_str(), std::vector<uint8_t>(data, data + n), lua_toboolean(L, 3) != 0);
+    std::string err = FindDiskFile(p.c_str()) ? "" : NewDiskFile(p.c_str());  // a path the game lacks: a new file
+    if (err.empty()) err = SetFileContents(p.c_str(), std::vector<uint8_t>(data, data + n), lua_toboolean(L, 3) != 0);
     if (err.empty()) { lua_pushboolean(L, 1); return 1; }
     lua_pushnil(L);
     lua_pushstring(L, err.c_str());
@@ -4200,7 +4393,7 @@ int LBlendUnload(lua_State* L) {
 // The skinning shader hook (skinhook.cpp): w3.skinhook in lua_lib.inc wraps these.
 int LSkinAdd(lua_State* L) {  // w3._skin_add(render mesh) -> slot | nil, error
     std::string err;
-    int slot = SkinHookAdd(static_cast<uintptr_t>(luaL_checkinteger(L, 1)), &err);
+    int slot = SkinHookAdd(static_cast<uintptr_t>(luaL_checkinteger(L, 1)), &err, lua_toboolean(L, 2) != 0);
     if (!slot) {
         lua_pushnil(L);
         lua_pushstring(L, err.c_str());
@@ -4386,6 +4579,25 @@ int LBlendNormals(lua_State* L) {  // w3._bs_normals(set or live mesh, on) -> tr
 int LSkinCapture(lua_State* L) {  // w3._skin_capture(slot, path) -> true | nil, error
     std::string err;
     if (!SkinHookCapture(static_cast<int>(luaL_checkinteger(L, 1)), BlendPath(luaL_checkstring(L, 2)), &err)) {
+        lua_pushnil(L);
+        lua_pushstring(L, err.c_str());
+        return 2;
+    }
+    lua_pushboolean(L, 1);
+    return 1;
+}
+// 19.11.: w3._pso_trace(frames, path): the pipelines the next frames set, how often, to a file (tw3se folder)
+int LPsoTrace(lua_State* L) {
+    int frames = static_cast<int>(luaL_checkinteger(L, 1));
+    const char* name = luaL_optstring(L, 2, "pso_trace.txt");
+    std::wstring path = Dir() + L"\\";
+    for (const char* c = name; *c; ++c) path += static_cast<wchar_t>(*c);
+    lua_pushboolean(L, RenderPsoTrace(frames, path));
+    return 1;
+}
+int LSkinDqs(lua_State* L) {  // w3._skin_dqs(slot, on) -> true | nil, error
+    std::string err;
+    if (!SkinHookDqs(static_cast<int>(luaL_checkinteger(L, 1)), lua_isnone(L, 2) || lua_toboolean(L, 2), &err)) {
         lua_pushnil(L);
         lua_pushstring(L, err.c_str());
         return 2;
@@ -5399,6 +5611,137 @@ int LAnimSample(lua_State* L) {
     return 1;
 }
 // w3._anim_pose(component, {{name, t, weight}, ...}): laid on the component every frame; {} takes it off
+// w3._anim_create(component, name, fps, {bone names}, raw): raw = frames x #bones x 10 float32 (position xyz,
+// rotation xyzw, scale xyz, each bone local to its parent) -> how many of the bones the figure's rig has
+int LAnimCreate(lua_State* L) {
+    Obj* o = CheckLive(L, 1);
+    const char* name = luaL_checkstring(L, 2);
+    float fps = static_cast<float>(luaL_checknumber(L, 3));
+    luaL_checktype(L, 4, LUA_TTABLE);
+    size_t len = 0;
+    const char* raw = luaL_checklstring(L, 5, &len);
+    std::vector<std::string> bones;
+    for (lua_Integer i = 1, n = luaL_len(L, 4); i <= n; ++i) {
+        lua_rawgeti(L, 4, i);
+        const char* b = lua_tostring(L, -1);
+        bones.emplace_back(b ? b : "");
+        lua_pop(L, 1);
+    }
+    size_t perFrame = bones.size() * 10 * 4;
+    if (bones.empty() || len == 0 || len % perFrame) return luaL_error(L, "w3.anim.create: the data is not frames x %d bones x 10 floats", static_cast<int>(bones.size()));
+    std::vector<float> data(len / 4);
+    memcpy(data.data(), raw, len);
+    uint32_t mapped = 0;
+    std::string err = AnimCreate(o->ptr, name, fps, bones, data.data(), static_cast<uint32_t>(len / perFrame), &mapped);
+    if (!err.empty()) return luaL_error(L, "w3.anim.create: %s", err.c_str());
+    lua_pushinteger(L, mapped);
+    return 1;
+}
+
+// w3._anim_publish(set, component, name): a made animation into a new CSkeletalAnimationSet and the engine's table of
+// animation names. The set keeps one reference for good: its entries point at the made animation.
+int LAnimPublish(lua_State* L) {
+    Obj* set = CheckLive(L, 1);
+    Obj* comp = CheckLive(L, 2);
+    const char* name = luaL_checkstring(L, 3);
+    void* hb = BlockOf(set->ptr);
+    if (!hb) return luaL_error(L, "w3.anim.create: the set has no handle");
+    std::string err = AnimPublish(set->ptr, comp->ptr, name);
+    if (!err.empty()) return luaL_error(L, "w3.anim.create: %s", err.c_str());
+    InterlockedIncrement(static_cast<volatile LONG*>(hb));
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+// w3._anim_shape(component, {bone = {scale = {x, y, z} or s, offset = {x, y, z}, rot = {x, y, z, w}}, ...})
+int LAnimBones(lua_State* L) {  // w3._anim_bones(component) -> {names in rig order}, or nil and the reason
+    Obj* o = CheckLive(L, 1);
+    std::vector<std::string> names;
+    std::string err = AnimBoneNames(o->ptr, &names);
+    if (!err.empty()) {
+        lua_pushnil(L);
+        lua_pushstring(L, err.c_str());
+        return 2;
+    }
+    lua_createtable(L, static_cast<int>(names.size()), 0);
+    for (size_t i = 0; i < names.size(); ++i) {
+        lua_pushstring(L, names[i].c_str());
+        lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
+    }
+    return 1;
+}
+int LAnimShape(lua_State* L) {
+    Obj* o = CheckLive(L, 1);
+    luaL_checktype(L, 2, LUA_TTABLE);
+    std::vector<std::pair<std::string, std::array<float, 12>>> bones;
+    auto vec = [&](int t, const char* key, float* out, int n) {  // a field: a number for every part or {x, y, ...}
+        lua_getfield(L, t, key);
+        if (lua_isnumber(L, -1)) {
+            for (int k = 0; k < n; ++k) out[k] = static_cast<float>(lua_tonumber(L, -1));
+        } else if (lua_istable(L, -1)) {
+            for (int k = 0; k < n; ++k) {
+                lua_rawgeti(L, -1, k + 1);
+                if (lua_isnumber(L, -1)) out[k] = static_cast<float>(lua_tonumber(L, -1));
+                lua_pop(L, 1);
+            }
+        }
+        lua_pop(L, 1);
+    };
+    lua_pushnil(L);
+    while (lua_next(L, 2)) {
+        if (lua_type(L, -2) == LUA_TSTRING && lua_istable(L, -1)) {
+            std::array<float, 12> v = {1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 0};
+            int t = lua_gettop(L);
+            vec(t, "scale", &v[0], 3);
+            vec(t, "offset", &v[3], 3);
+            vec(t, "length", &v[10], 1);
+            lua_getfield(L, t, "inherit");
+            lua_getfield(L, t, "only");
+            v[11] = lua_toboolean(L, -2) ? 1.0f : lua_toboolean(L, -1) ? 2.0f : 0.0f;
+            lua_pop(L, 2);
+            float r[4] = {0, 0, 0, 1};
+            vec(t, "rot", r, 4);
+            float len = sqrtf(r[0] * r[0] + r[1] * r[1] + r[2] * r[2] + r[3] * r[3]);
+            for (int k = 0; k < 4; ++k) v[6 + k] = len > 1e-6f ? r[k] / len : (k == 3 ? 1.0f : 0.0f);
+            bones.emplace_back(lua_tostring(L, -2), v);
+        }
+        lua_pop(L, 1);
+    }
+    std::string err = AnimShapeSet(o->ptr, bones);
+    if (!err.empty()) return luaL_error(L, "w3.anim.shape: %s", err.c_str());
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+// w3._anim_record(component, maxSeconds) / w3._anim_record_stop(component, fps) -> {fps, bones, raw}
+int LAnimRecord(lua_State* L) {
+    Obj* o = CheckLive(L, 1);
+    std::string err = AnimRecordStart(o->ptr, static_cast<float>(luaL_optnumber(L, 2, 60)));
+    if (!err.empty()) return luaL_error(L, "w3.anim.record: %s", err.c_str());
+    lua_pushboolean(L, 1);
+    return 1;
+}
+int LAnimRecordStop(lua_State* L) {
+    Obj* o = CheckLive(L, 1);
+    float fps = static_cast<float>(luaL_optnumber(L, 2, 30));
+    std::vector<std::string> bones;
+    std::vector<float> data;
+    std::string err = AnimRecordStop(o->ptr, fps, &bones, &data);
+    if (!err.empty()) return luaL_error(L, "w3.anim.record_stop: %s", err.c_str());
+    lua_createtable(L, 0, 3);
+    lua_pushnumber(L, fps);
+    lua_setfield(L, -2, "fps");
+    lua_createtable(L, static_cast<int>(bones.size()), 0);
+    for (size_t i = 0; i < bones.size(); ++i) {
+        lua_pushstring(L, bones[i].c_str());
+        lua_rawseti(L, -2, static_cast<lua_Integer>(i) + 1);
+    }
+    lua_setfield(L, -2, "bones");
+    lua_pushlstring(L, reinterpret_cast<const char*>(data.data()), data.size() * 4);
+    lua_setfield(L, -2, "raw");
+    return 1;
+}
+
 int LAnimPose(lua_State* L) {
     Obj* o = CheckLive(L, 1);
     luaL_checktype(L, 2, LUA_TTABLE);
@@ -6594,7 +6937,7 @@ lua_State* State() {
                            {"on_tick", &LOnTick}, {"off_tick", &LOffTick}, {"_message_take", &LMessageTake}, {"_message_send", &LMessageSend}, {"_tw3se_config", &LTw3seConfig}, {"time", &LTime}, {"_mod", &LCurMod}, {"_mods", &LModsList}, {"use", &LUse}, {"_plugins", &LPluginsList}, {"_var_get", &LVarGet}, {"_var_set", &LVarSet}, {"_list", &LListDir}, {"_tw3se", &LTw3seInfo}, {"_menu_key", &LMenuKey}, {"_key_capture", &LKeyCapture}, {"off_draw", &LOffDraw}, {"valid", &LValid}, {"on_draw", &LOnDraw},
                            {"screen_size", &LScreenSize}, {"entities", &LEntities},
                            {"by_guid", &LByGuid}, {"guid", &LGuid},
-                           {"addr", &LAddr}, {"peek", &LPeek}, {"_type", &LTypeAddr}, {"_cname", &LCNameText}, {"hwwatch", &LHwWatch}, {"rva", &LRva}, {"poke", &LPoke}, {"_fault", &LFault}, {"declare", &LDeclare}, {"discard", &LDiscard}, {"engine_hook", &LEngineHook}, {"engine_unhook", &LEngineUnhook}, {"engine_hooks", &LEngineHooks}, {"_scene_stop", &LSceneStop}, {"watch_latent", &LWatchLatent}, {"unwatch_latent", &LUnwatchLatent}, {"new_enum", &LNewEnum}, {"_anim_add_set", &LAnimAddSet}, {"_anim_remove_set", &LAnimRemoveSet}, {"script_stack", &LScriptStack}, {"vhook", &LVHook}, {"vunhook", &LVUnhook},
+                           {"addr", &LAddr}, {"peek", &LPeek}, {"_type", &LTypeAddr}, {"_cname", &LCNameText}, {"hwwatch", &LHwWatch}, {"rva", &LRva}, {"poke", &LPoke}, {"_fault", &LFault}, {"declare", &LDeclare}, {"discard", &LDiscard}, {"engine_hook", &LEngineHook}, {"engine_unhook", &LEngineUnhook}, {"engine_hooks", &LEngineHooks}, {"engine_call", &LEngineCall}, {"_mem_alloc", &LMemAlloc}, {"_mem_read", &LMemRead}, {"_mem_write", &LMemWrite}, {"_mem_free", &LMemFree}, {"engine_addr", &LEngineAddr}, {"_scene_stop", &LSceneStop}, {"watch_latent", &LWatchLatent}, {"unwatch_latent", &LUnwatchLatent}, {"new_enum", &LNewEnum}, {"_anim_add_set", &LAnimAddSet}, {"_anim_remove_set", &LAnimRemoveSet}, {"script_stack", &LScriptStack}, {"vhook", &LVHook}, {"vunhook", &LVUnhook},
                            {"vslot", &LVSlot}, {"object", &LObjectAt}, {"on_line", &LOnLine}, {"off_line", &LOffLine}, {"dir", &LDir},
                            {"_mat_params", &LMatParams}, {"_mat_set", &LMatSet},
                            {"_files_reload", &LFilesReload}, {"_files_set", &LFilesSet}, {"_files_clear", &LFilesClear}, {"_diskfile", &LDiskFile},
@@ -6605,14 +6948,14 @@ lua_State* State() {
                            {"_dbg_alive", &LDbgAlive}, {"_typename", &LTypeName}, {"_px_scene", &LPxScene},
                            {"_px_gravity", &LPxGravity}, {"_config", &LConfig}, {"_config_list", &LConfigList},
                            {"_sector", &LSectorList}, {"_sector_meshes", &LSectorMeshes}, {"_sector_world", &LSectorWorld}, {"_mesh_path", &LMeshPath}, {"_sector_pos", &LSectorSetPos},
-                           {"_terrain_overlay", &LTerrainOverlay}, {"_terrain_probe", &LTerrainProbe}, {"_rest_bones", &LRestBones}, {"_terrain_raise", &LTerrainRaise}, {"_scene_time", &LSceneTime}, {"_anim_sample", &LAnimSample}, {"_view_rect", &LViewRect}, {"_anim_pose", &LAnimPose}, {"_scene_pause", &LScenePause}, {"_scene_elements", &LSceneElements}, {"_scene_seek", &LSceneSeek}, {"_decal_spawn", &LDecalSpawn}, {"_decal_remove", &LDecalRemove}, {"_decal_clear", &LDecalClear}, {"_decal_count", &LDecalCount}, {"_decal_per_mesh", &LDecalPerMesh}, {"_decal_color", &LDecalColor}, {"_net_http", &LNetHttp}, {"_net_connect", &LNetConnect},
+                           {"_terrain_overlay", &LTerrainOverlay}, {"_terrain_probe", &LTerrainProbe}, {"_rest_bones", &LRestBones}, {"_terrain_raise", &LTerrainRaise}, {"_scene_time", &LSceneTime}, {"_anim_sample", &LAnimSample}, {"_view_rect", &LViewRect}, {"_anim_pose", &LAnimPose}, {"_anim_create", &LAnimCreate}, {"_anim_publish", &LAnimPublish}, {"_anim_record", &LAnimRecord}, {"_anim_shape", &LAnimShape}, {"_anim_bones", &LAnimBones}, {"_anim_record_stop", &LAnimRecordStop}, {"_scene_pause", &LScenePause}, {"_scene_elements", &LSceneElements}, {"_scene_seek", &LSceneSeek}, {"_decal_spawn", &LDecalSpawn}, {"_decal_remove", &LDecalRemove}, {"_decal_clear", &LDecalClear}, {"_decal_count", &LDecalCount}, {"_decal_per_mesh", &LDecalPerMesh}, {"_decal_color", &LDecalColor}, {"_net_http", &LNetHttp}, {"_net_connect", &LNetConnect},
                            {"_net_udp", &LNetUdp}, {"_net_send", &LNetSend}, {"_net_close", &LNetClose}, {"_net_poll", &LNetPoll},
                            {"report", &LReport},
                            {"_deform_probe", &LDeformProbe}, {"_deform_stats", &LDeformStats}, {"_memfind", &LMemFind}, {"_bs_load", &LBlendLoad}, {"_bs_set", &LBlendSet},
                            {"_bs_names", &LBlendNames}, {"_bs_state", &LBlendState}, {"_bs_unload", &LBlendUnload},
                            {"_bs_dump", &LBlendDump}, {"_bs_stats", &LBlendStats}, {"_shot_burst", &LShotBurst}, {"_bs_forget", &LBlendForget}, {"_bs_reset_all", &LBlendResetAll}, {"_render_rebuild", &LRenderRebuild},
                            {"_lm_new", &LLiveNew}, {"_lm_attach", &LLiveAttach}, {"_lm_fail", &LLiveFail}, {"_lm_close", &LLiveClose},
-                           {"_lm_info", &LLiveInfo}, {"_lm_write", &LLiveWrite}, {"_lm_bounds", &LLiveBounds}, {"_tex_probe", &LTexProbe}, {"_tex_test", &LTexTest}, {"_tex_stats", &LTexStats}, {"_tex_readback", &LTexReadback}, {"_bs_index_dump", &LIndexDump}, {"_skin_capture", &LSkinCapture}, {"_skin_mush", &LSkinMush}, {"_skin_mush_mask", &LSkinMushMask}, {"_skin_mush_dump", &LMushDump}, {"_skin_overlay_test", &LSkinOverlayTest}, {"_skin_material_test", &LSkinMaterialTest}, {"_skin_overlay_raw", &LSkinOverlayRaw}, {"_bs_normals", &LBlendNormals}, {"_skin_caps_ex", &LSkinCapsulesEx},
+                           {"_lm_info", &LLiveInfo}, {"_lm_write", &LLiveWrite}, {"_lm_bounds", &LLiveBounds}, {"_tex_probe", &LTexProbe}, {"_tex_test", &LTexTest}, {"_tex_stats", &LTexStats}, {"_tex_readback", &LTexReadback}, {"_bs_index_dump", &LIndexDump}, {"_skin_capture", &LSkinCapture}, {"_skin_mush", &LSkinMush}, {"_skin_dqs", &LSkinDqs}, {"_pso_trace", &LPsoTrace}, {"_skin_mush_mask", &LSkinMushMask}, {"_skin_mush_dump", &LMushDump}, {"_skin_overlay_test", &LSkinOverlayTest}, {"_skin_material_test", &LSkinMaterialTest}, {"_skin_overlay_raw", &LSkinOverlayRaw}, {"_bs_normals", &LBlendNormals}, {"_skin_caps_ex", &LSkinCapsulesEx},
                            {"_skin_add", &LSkinAdd}, {"_skin_remove", &LSkinRemove}, {"_skin_caps", &LSkinCapsules},
                            {"_skin_stats", &LSkinStats}, {"_skin_state", &LSkinState},
                            {"_skin_weights", &LSkinWeights}, {"_skin_chunks", &LSkinChunks},

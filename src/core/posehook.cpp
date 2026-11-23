@@ -2118,7 +2118,224 @@ void* WalkFindAnimation(void* cont, uint32_t id) {
     return nullptr;
 }
 
+// --- animations made at run time (w3.anim.create): an engine animation built in memory for one rig. A
+// CSkeletalAnimation whose animBuffer is a CAnimationBufferUncompressed, both made by their classes (TTypedClass slot
+// 10 constructs an object in place) in the engine's memory, so CSkeletalAnimation::Sample plays it with the engine's
+// own code (it calls the buffer's slot 42, which reads two whole frames through slot 40 and blends them). The
+// uncompressed buffer (measured in its slot 40, 6adfbd7a): +0x10 frames, +0x14 bones, +0x18 float tracks, +0x1c
+// floats a frame; then {pointer, count} arrays of 12 bytes: +0x20 one byte a value (1: the next value of the
+// constant array), +0x2c the frames, +0x38 the constant values, +0x44 the tracks. A bone is 10 values: position xyz,
+// rotation xyzw, scale xyz. Bones the source does not name keep the figure's own pose (the mask below).
+struct CustomAnim {
+    void* skel;
+    uint32_t name;
+    void* anim;
+    std::vector<uint8_t> carry;  // per rig bone: 1 = the animation moves it
+};
+std::mutex g_customMx;
+std::vector<std::shared_ptr<const CustomAnim>> g_custom;
+
+std::shared_ptr<const CustomAnim> CustomFor(void* skel, uint32_t name) {
+    std::lock_guard<std::mutex> l(g_customMx);
+    for (auto it = g_custom.rbegin(); it != g_custom.rend(); ++it)
+        if ((*it)->skel == skel && (*it)->name == name) return *it;
+    return nullptr;
+}
+std::shared_ptr<const CustomAnim> CustomByAnim(void* anim) {
+    std::lock_guard<std::mutex> l(g_customMx);
+    for (auto& c : g_custom)
+        if (c->anim == anim) return c;
+    return nullptr;
+}
+
+using Construct_t = void (*)(void* cls, void* mem);
+bool ConstructGuarded(Construct_t ctor, void* cls, void* mem) {
+    __try {
+        ctor(cls, mem);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+// An object of a native class in the engine's memory, made by the class itself (its TTypedClass, slot 10).
+void* NewNative(const char* className, std::string* err) {
+    void* cls = RttiFindType(className);
+    uint32_t size = cls ? RttiSize(cls) : 0;
+    void* vt = nullptr;
+    Construct_t ctor = nullptr;
+    if (!cls || !size || !GRead(cls, &vt, 8) || !vt || !GRead(static_cast<void**>(vt) + 10, &ctor, 8) || !ctor) {
+        *err = std::string("the class ") + className + " cannot be made";
+        return nullptr;
+    }
+    void* mem = EngineAlloc(size, 16);
+    if (!mem) {
+        *err = "no engine memory";
+        return nullptr;
+    }
+    memset(mem, 0, size);
+    if (!ConstructGuarded(ctor, cls, mem)) {
+        *err = std::string("making a ") + className + " faulted";
+        return nullptr;
+    }
+    return mem;
+}
+
+// The rig's bone names and its rest pose (48 bytes a bone), "" on success.
+std::string RigOf(void* skel, std::vector<std::string>* names, std::vector<float>* rest) {
+    if (!g_so.ok) return "the skeleton's fields are not known for this game build";
+    char* bones = nullptr;
+    const char* ls = nullptr;
+    uint32_t nb = 0, nls = 0;
+    GRead(static_cast<char*>(skel) + g_so.bones, &bones, 8);
+    GRead(static_cast<char*>(skel) + g_so.bones + 8, &nb, 4);
+    GRead(static_cast<char*>(skel) + FieldOr("CSkeleton.referencePoseLS", 0x90), &ls, 8);
+    GRead(static_cast<char*>(skel) + FieldOr("CSkeleton.boneCount", 0x70), &nls, 4);
+    if (!bones || !ls || nb == 0 || nb > 2048 || nls != nb) return "the rig's bones cannot be read";
+    names->assign(nb, "");
+    for (uint32_t i = 0; i < nb; ++i) {
+        uint32_t id = 0;
+        GRead(bones + static_cast<size_t>(i) * g_so.boneSize + g_so.boneName, &id, 4);
+        const char* s = GetCNameString(id);
+        (*names)[i] = s ? s : "";
+    }
+    rest->assign(static_cast<size_t>(nb) * 12, 0.0f);
+    if (!GRead(ls, rest->data(), rest->size() * 4)) return "the rig's rest pose cannot be read";
+    return "";
+}
+
+}  // namespace
+
+// w3.anim.create: an animation `name` for the component's rig from `frames` x `boneNames` records of 10 floats
+// (position xyz, rotation xyzw, local to the parent, scale xyz), at `fps`. Replaces one of the same name on the rig.
+std::string AnimCreate(void* comp, const char* name, float fps, const std::vector<std::string>& boneNames,
+                       const float* data, uint32_t frames, uint32_t* mapped) {
+    FindSkelOffsets();  // (main thread: w3.anim.create is called from Lua)
+    void* skel = SkeletonPtr(comp);
+    if (!skel) return "the figure has no rig";
+    if (!(fps > 0) || frames == 0) return "fps and at least one frame are needed";
+    std::vector<std::string> rig;
+    std::vector<float> rest;
+    std::string err = RigOf(skel, &rig, &rest);
+    if (!err.empty()) return err;
+    uint32_t n = static_cast<uint32_t>(rig.size());
+    std::vector<int32_t> to(boneNames.size(), -1);  // source bone -> rig bone
+    auto c = std::make_shared<CustomAnim>();
+    c->carry.assign(n, 0);
+    *mapped = 0;
+    for (size_t i = 0; i < boneNames.size(); ++i) {
+        auto it = std::find(rig.begin(), rig.end(), boneNames[i]);
+        if (it == rig.end()) continue;
+        to[i] = static_cast<int32_t>(it - rig.begin());
+        if (!c->carry[to[i]]) ++*mapped;
+        c->carry[to[i]] = 1;
+    }
+    if (!*mapped) return "no bone of the animation is in the figure's rig";
+    size_t stride = static_cast<size_t>(n) * 10;
+    float* flat = static_cast<float*>(EngineAlloc(stride * frames * 4, 16));
+    uint8_t* flags = static_cast<uint8_t*>(EngineAlloc(stride, 16));
+    if (!flat || !flags) return "no engine memory";
+    memset(flags, 0, stride);  // every value from the frames
+    for (uint32_t f = 0; f < frames; ++f) {
+        float* fr = flat + stride * f;
+        for (uint32_t b = 0; b < n; ++b) {  // the rest pose for what the source does not name
+            const float* r = rest.data() + static_cast<size_t>(b) * 12;
+            float* o = fr + static_cast<size_t>(b) * 10;
+            o[0] = r[0], o[1] = r[1], o[2] = r[2];
+            o[3] = r[4], o[4] = r[5], o[5] = r[6], o[6] = r[7];
+            o[7] = r[8], o[8] = r[9], o[9] = r[10];
+        }
+        const float* src = data + boneNames.size() * 10 * f;
+        for (size_t i = 0; i < boneNames.size(); ++i)
+            if (to[i] >= 0)
+                for (int k = 0; k < 10; ++k)  // NaN: the rest pose's value (a rotation alone keeps the bone's place)
+                    if (!std::isnan(src[i * 10 + k])) fr[static_cast<size_t>(to[i]) * 10 + k] = src[i * 10 + k];
+    }
+    void* buffer = NewNative("CAnimationBufferUncompressed", &err);
+    if (!buffer) return err;
+    void* anim = NewNative("CSkeletalAnimation", &err);
+    if (!anim) return err;
+    auto put32 = [](void* obj, uint32_t off, uint32_t v) { memcpy(static_cast<char*>(obj) + off, &v, 4); };
+    auto putPtr = [](void* obj, uint32_t off, const void* p) { memcpy(static_cast<char*>(obj) + off, &p, 8); };
+    put32(buffer, 0x10, frames);
+    put32(buffer, 0x14, n);
+    put32(buffer, 0x18, 0);
+    put32(buffer, 0x1c, static_cast<uint32_t>(stride));
+    putPtr(buffer, 0x20, flags);
+    put32(buffer, 0x28, static_cast<uint32_t>(stride));
+    putPtr(buffer, 0x2c, flat);
+    put32(buffer, 0x34, static_cast<uint32_t>(stride * frames));
+    uint32_t nameId = InternName(name);
+    float duration = frames > 1 ? (frames - 1) / fps : 0.0f;
+    put32(anim, FieldOr("CSkeletalAnimation.name", 0x18), nameId);
+    putPtr(anim, FieldOr("CSkeletalAnimation.animBuffer", 0x20), buffer);
+    memcpy(static_cast<char*>(anim) + 0x28, &fps, 4);       // framesPerSecond
+    memcpy(static_cast<char*>(anim) + 0x2c, &duration, 4);  // duration
+    c->skel = skel;
+    c->name = nameId;
+    c->anim = anim;
+    std::lock_guard<std::mutex> l(g_customMx);
+    g_custom.erase(std::remove_if(g_custom.begin(), g_custom.end(),
+                                  [&](const std::shared_ptr<const CustomAnim>& x) {
+                                      return x->skel == skel && x->name == nameId;
+                                  }),
+                   g_custom.end());  // (the old one's memory stays: a pose layer may still sample it this frame)
+    g_custom.push_back(c);
+    Log("anim: %s made for a rig of %u bones (%u of the animation's %zu in it), %u frames at %.1f fps", name, n,
+        *mapped, boneNames.size(), frames, fps);
+    return "";
+}
+
+namespace {
+using SetPostLoad_t = void (*)(void* set);
+bool PostLoadGuarded(SetPostLoad_t fn, void* set) {
+    __try {
+        fn(set);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+}  // namespace
+
+// The made animation `name` of the component's rig into a fresh CSkeletalAnimationSet (w3.new), so the engine's own
+// lookup by name finds it (slot animations, scenes, the behavior graph) once the set is in the figure's container.
+// A set entry (+0x18 its set, +0x20 its animation; the animation's +0x10 its entry) in the set's `animations`, then
+// the set's slot 7, which adds each entry to the global table name -> entries (measured in 6adfbd7a: the head of
+// the name's chain goes to entry+0x48, the entry becomes the head). A set may only go through slot 7 once (twice
+// would chain an entry to itself), so the set has to be empty.
+std::string AnimPublish(void* set, void* comp, const char* name) {
+    FindSkelOffsets();
+    auto c = CustomFor(SkeletonPtr(comp), InternName(name));
+    if (!c) return std::string("no made animation ") + name + " on this figure's rig";
+    uint32_t animsOff = PropOffset("CSkeletalAnimationSet", "animations", 0x98), count = 0;
+    GRead(static_cast<char*>(set) + animsOff + 8, &count, 4);
+    if (count) return "the set has animations already (use a new one)";
+    std::string why;
+    auto postLoad = reinterpret_cast<SetPostLoad_t>(EngineResolve("CSkeletalAnimationSet::vf7", &why));
+    if (!postLoad) return why;
+    std::string err;
+    void* entry = NewNative("CSkeletalAnimationSetEntry", &err);
+    if (!entry) return err;
+    void** arr = static_cast<void**>(EngineAlloc(8, 8));
+    if (!arr) return "no engine memory";
+    arr[0] = entry;
+    char* e = static_cast<char*>(entry);
+    memcpy(e + 0x18, &set, 8);
+    memcpy(e + PropOffset("CSkeletalAnimationSetEntry", "animation", 0x20), &c->anim, 8);
+    memcpy(static_cast<char*>(c->anim) + 0x10, &entry, 8);
+    uint32_t one = 1;
+    memcpy(static_cast<char*>(set) + animsOff, &arr, 8);
+    memcpy(static_cast<char*>(set) + animsOff + 8, &one, 4);
+    memcpy(static_cast<char*>(set) + animsOff + 12, &one, 4);
+    if (!PostLoadGuarded(postLoad, set)) return "the set's set-up faulted (caught)";
+    Log("anim: %s is in the engine's table of animations", name);
+    return "";
+}
+
+namespace {
+
 void* AnimationOf(void* comp, const char* name, std::string* err) {
+    if (auto c = CustomFor(SkeletonPtr(comp), InternName(name))) return c->anim;  // w3.anim.create
     auto find = reinterpret_cast<FindAnim_t>(Address("CSkeletalAnimationContainer::FindAnimation"));
     if (!Address("CSkeletalAnimation::Sample") || !Address("CSkeletalAnimation::IsLoaded")) {
         *err = "sampling animations is not known for this game build";
@@ -2193,6 +2410,10 @@ void ApplyLayers(char* output, const std::vector<PoseLayer>& layers) {  // C++ o
         if (!(l.weight > 0)) continue;
         memcpy(sample.data(), pose, static_cast<size_t>(n) * 48);  // bones the animation lacks keep the graph's
         if (SampleGuarded(l.anim, l.t, n, sample.data()) != 1) continue;
+        if (auto c = CustomByAnim(l.anim))  // a made animation: the bones it does not name keep the graph's pose
+            for (uint32_t b = 0; b < n; ++b)
+                if (b >= c->carry.size() || !c->carry[b])
+                    memcpy(sample.data() + static_cast<size_t>(b) * 12, pose + static_cast<size_t>(b) * 12, 48);
         sum += l.weight;
         if (sum == l.weight) memcpy(mix.data(), sample.data(), static_cast<size_t>(n) * 48);
         else Blend(mix.data(), sample.data(), n, l.weight / sum);
@@ -2212,18 +2433,153 @@ void ApplyLayersGuarded(char* output, const std::vector<PoseLayer>* layers) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
 }
-uint64_t BonesMSHook(char* output, void* skeleton, char* out, uint32_t maxBones) {
-    if (g_layerCount.load(std::memory_order_relaxed) > 0 && output && out) {
-        char* comp = out - FieldOr("CAnimatedComponent.bonesMS", PoseOff(0xddc));
-        std::shared_ptr<const std::vector<PoseLayer>> layers;
-        {
-            std::lock_guard<std::mutex> lk(g_layerMx);
-            auto it = g_layers.find(comp);
-            if (it != g_layers.end()) layers = it->second;
+// --- recording a figure's pose (w3.anim.record): each frame the local pose the step gets (after the layers), as 10
+// floats a bone (position xyz, rotation xyzw, scale xyz) with the time; on stop resampled to a fixed rate.
+struct PoseRec {
+    uint32_t n = 0;
+    std::vector<float> values;     // frames x n x 10
+    std::vector<double> times;     // seconds since the start
+    LARGE_INTEGER start{};
+    size_t maxFrames = 0;
+};
+std::mutex g_recMx;
+std::unordered_map<void*, PoseRec> g_recs;  // by component
+std::atomic<int> g_recCount{0};
+double g_qpcFreq = 0;
+
+void RecordFrame(char* comp, char* output) {  // C++ objects here; the caller guards
+    float* pose = nullptr;
+    uint32_t n = 0;
+    GRead(output, &pose, 8);
+    GRead(output + FieldOr("SBehaviorGraphOutput.numBones", 0x18), &n, 4);
+    if (!pose || n == 0 || n > 512) return;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    std::lock_guard<std::mutex> lk(g_recMx);
+    auto it = g_recs.find(comp);
+    if (it == g_recs.end()) return;
+    PoseRec& r = it->second;
+    if (r.n == 0) r.n = n;
+    if (n != r.n || r.times.size() >= r.maxFrames) return;
+    size_t at = r.values.size();
+    r.values.resize(at + static_cast<size_t>(n) * 10);
+    float* o = r.values.data() + at;
+    for (uint32_t b = 0; b < n; ++b, o += 10) {
+        const float* q = pose + static_cast<size_t>(b) * 12;
+        o[0] = q[0], o[1] = q[1], o[2] = q[2];
+        o[3] = q[4], o[4] = q[5], o[5] = q[6], o[6] = q[7];
+        o[7] = q[8], o[8] = q[9], o[9] = q[10];
+    }
+    r.times.push_back(static_cast<double>(now.QuadPart - r.start.QuadPart) / g_qpcFreq);
+}
+void RecordFrameCpp(char* comp, char* output) {
+    try {
+        RecordFrame(comp, output);
+    } catch (...) {
+    }
+}
+void RecordFrameGuarded(char* comp, char* output) {
+    __try {
+        RecordFrameCpp(comp, output);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+// --- a figure's proportions (w3.anim.shape): per bone a scale, an offset and a turn on its local pose, every frame
+// after the layers. Children follow (their place is in the bone's space), and so does every mesh skinned to them.
+// The engine's step to model space passes a bone's scale on to its children's size but not to their places
+// (measured, _scratch/anim_scale_probe.py: the pelvis at 1.5 made the head 1.46 times as big and left it where it
+// was). So "inherit" moves the bones below apart by the scales above them (places only; their size grows by the
+// engine), and "only" keeps the scale on the bone itself: its direct children get 1/scale.
+struct BoneShape {
+    uint32_t bone;
+    float scale[3], offset[3], rot[4];  // rot: a quaternion xyzw applied after the bone's own turn
+    float length;                       // the bone's place times this: its distance to the parent
+};
+struct ShapeSet {
+    std::vector<BoneShape> bones;
+    std::vector<float> chain;    // per rig bone xyz: its place times the inherited scales above it (empty: none)
+    std::vector<float> counter;  // per rig bone xyz: its own scale times this ("only" on its parent; empty: none)
+};
+std::mutex g_shapeMx;
+std::unordered_map<void*, std::shared_ptr<const ShapeSet>> g_shapes;  // by component
+std::atomic<int> g_shapeCount{0};
+
+void ApplyShape(char* output, const ShapeSet& set) {
+    float* pose = nullptr;
+    uint32_t n = 0;
+    GRead(output, &pose, 8);
+    GRead(output + FieldOr("SBehaviorGraphOutput.numBones", 0x18), &n, 4);
+    if (!pose || n == 0 || n > 512) return;
+    if (set.chain.size() >= static_cast<size_t>(n) * 3)
+        for (uint32_t b = 0; b < n; ++b) {
+            const float* c = set.chain.data() + static_cast<size_t>(b) * 3;
+            if (c[0] == 1 && c[1] == 1 && c[2] == 1) continue;
+            float* q = pose + static_cast<size_t>(b) * 12;
+            for (int k = 0; k < 3; ++k) q[k] *= c[k];
         }
-        if (layers) ApplyLayersGuarded(output, layers.get());
+    if (set.counter.size() >= static_cast<size_t>(n) * 3)
+        for (uint32_t b = 0; b < n; ++b) {
+            const float* c = set.counter.data() + static_cast<size_t>(b) * 3;
+            if (c[0] == 1 && c[1] == 1 && c[2] == 1) continue;
+            float* q = pose + static_cast<size_t>(b) * 12;
+            for (int k = 0; k < 3; ++k) q[8 + k] *= c[k];
+        }
+    for (const BoneShape& s : set.bones) {
+        if (s.bone >= n) continue;
+        float* q = pose + static_cast<size_t>(s.bone) * 12;
+        for (int k = 0; k < 3; ++k) q[k] = q[k] * s.length + s.offset[k];
+        float ax = q[4], ay = q[5], az = q[6], aw = q[7], bx = s.rot[0], by = s.rot[1], bz = s.rot[2], bw = s.rot[3];
+        q[4] = aw * bx + ax * bw + ay * bz - az * by;  // own turn, then the shape's
+        q[5] = aw * by - ax * bz + ay * bw + az * bx;
+        q[6] = aw * bz + ax * by - ay * bx + az * bw;
+        q[7] = aw * bw - ax * bx - ay * by - az * bz;
+        for (int k = 0; k < 3; ++k) q[8 + k] *= s.scale[k];
+    }
+}
+void ApplyShapeGuarded(char* output, const ShapeSet* shape) {
+    __try {
+        ApplyShape(output, *shape);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+uint64_t BonesMSHook(char* output, void* skeleton, char* out, uint32_t maxBones) {
+    bool layers0 = g_layerCount.load(std::memory_order_relaxed) > 0, rec = g_recCount.load(std::memory_order_relaxed) > 0,
+         shaped = g_shapeCount.load(std::memory_order_relaxed) > 0;
+    if ((layers0 || rec || shaped) && output && out) {
+        char* comp = out - FieldOr("CAnimatedComponent.bonesMS", PoseOff(0xddc));
+        if (layers0) {
+            std::shared_ptr<const std::vector<PoseLayer>> layers;
+            {
+                std::lock_guard<std::mutex> lk(g_layerMx);
+                auto it = g_layers.find(comp);
+                if (it != g_layers.end()) layers = it->second;
+            }
+            if (layers) ApplyLayersGuarded(output, layers.get());
+        }
+        if (shaped) {
+            std::shared_ptr<const ShapeSet> shape;
+            {
+                std::lock_guard<std::mutex> lk(g_shapeMx);
+                auto it = g_shapes.find(comp);
+                if (it != g_shapes.end()) shape = it->second;
+            }
+            if (shape) ApplyShapeGuarded(output, shape.get());
+        }
+        if (rec) RecordFrameGuarded(comp, output);
     }
     return oBonesMS(output, skeleton, out, maxBones);
+}
+
+std::string EnsureBonesHook() {
+    if (oBonesMS) return "";
+    void* target = reinterpret_cast<void*>(Address("SBehaviorGraphOutput::GetBonesModelSpace"));
+    if (!target) return "laying a pose is not known for this game build";
+    if (!Hook(target, reinterpret_cast<void*>(&BonesMSHook), reinterpret_cast<void**>(&oBonesMS)))
+        return "the model-space step could not be hooked";
+    Log("posehook: animation pose hook in");
+    return "";
 }
 
 using ToMatrixQs_t = void* (*)(const void* qs, float* out);
@@ -2317,12 +2673,9 @@ std::string PoseLayersSet(void* comp, const std::vector<std::tuple<std::string, 
         if (!anim) return err;
         list->push_back({anim, std::get<1>(l), std::get<2>(l)});
     }
-    if (!list->empty() && !oBonesMS) {
-        void* target = reinterpret_cast<void*>(Address("SBehaviorGraphOutput::GetBonesModelSpace"));
-        if (!target) return "laying a pose is not known for this game build";
-        if (!Hook(target, reinterpret_cast<void*>(&BonesMSHook), reinterpret_cast<void**>(&oBonesMS)))
-            return "the model-space step could not be hooked";
-        Log("posehook: animation pose hook in");
+    if (!list->empty()) {
+        std::string e = EnsureBonesHook();
+        if (!e.empty()) return e;
     }
     std::lock_guard<std::mutex> lk(g_layerMx);
     if (list->empty()) g_layers.erase(comp);
@@ -2330,6 +2683,159 @@ std::string PoseLayersSet(void* comp, const std::vector<std::tuple<std::string, 
     g_layerCount.store(static_cast<int>(g_layers.size()), std::memory_order_relaxed);
     return "";
 }
+// w3.anim.shape: the figure's bones by name with {scale xyz, offset xyz, rot xyzw}; empty takes the shape off. Main
+// thread. A bone the rig lacks is an error.
+// The bone names of an animated component's rig (a figure's, a head's mimic rig), in rig order.
+std::string AnimBoneNames(void* comp, std::vector<std::string>* names) {
+    FindSkelOffsets();
+    if (!comp || !IsScriptable(comp) || !DerivesFromGuarded(comp, "CAnimatedComponent"))
+        return "an animated figure or component is needed";
+    void* skel = SkeletonPtr(comp);
+    if (!skel) return "the component has no skeleton";
+    std::vector<float> rest;
+    return RigOf(skel, names, &rest);
+}
+
+std::string AnimShapeSet(void* comp, const std::vector<std::pair<std::string, std::array<float, 12>>>& bones) {
+    FindSkelOffsets();
+    if (!comp || !IsScriptable(comp) || !DerivesFromGuarded(comp, "CAnimatedComponent"))
+        return "an animated figure or component is needed";
+    auto list = std::make_shared<ShapeSet>();
+    if (!bones.empty()) {
+        void* skel = SkeletonPtr(comp);
+        std::vector<std::string> rig;
+        std::vector<float> rest;
+        std::string e = RigOf(skel, &rig, &rest);
+        if (!e.empty()) return e;
+        size_t n = rig.size();
+        std::vector<float> passOn(n * 3, 1.0f);  // what each bone passes on to the bones below it
+        std::vector<int> only;                   // bones whose scale stays on themselves
+        bool inherit = false;
+        for (const auto& b : bones) {
+            auto it = std::find(rig.begin(), rig.end(), b.first);
+            if (it == rig.end()) return "the rig has no bone " + b.first;
+            BoneShape s{static_cast<uint32_t>(it - rig.begin())};
+            memcpy(s.scale, &b.second[0], 12);
+            memcpy(s.offset, &b.second[3], 12);
+            memcpy(s.rot, &b.second[6], 16);
+            s.length = b.second[10];
+            if (b.second[11] == 1) {
+                inherit = true;
+                memcpy(&passOn[static_cast<size_t>(s.bone) * 3], s.scale, 12);
+            } else if (b.second[11] == 2) {
+                only.push_back(static_cast<int>(s.bone));
+            }
+            list->bones.push_back(s);
+        }
+        std::vector<int16_t> parents;
+        if (inherit || !only.empty()) {
+            int16_t* par = nullptr;
+            uint32_t np = 0;
+            GRead(static_cast<char*>(skel) + g_so.parents, &par, 8);
+            GRead(static_cast<char*>(skel) + g_so.parents + 8, &np, 4);
+            parents.resize(np);
+            if (!par || np != n || !GRead(par, parents.data(), np * 2)) return "the rig's parents cannot be read";
+        }
+        if (!only.empty()) {
+            list->counter.assign(n * 3, 1.0f);
+            for (int o : only) {
+                const BoneShape* s = nullptr;
+                for (const BoneShape& x : list->bones)
+                    if (static_cast<int>(x.bone) == o) s = &x;
+                for (size_t c = 0; c < n && s; ++c)
+                    if (parents[c] == o)
+                        for (int k = 0; k < 3; ++k)
+                            list->counter[c * 3 + k] *= s->scale[k] != 0 ? 1.0f / s->scale[k] : 1.0f;
+            }
+        }
+        if (inherit) {  // the parents come before their children in the rig
+            list->chain.assign(n * 3, 1.0f);
+            std::vector<float> below(n * 3, 1.0f);  // the scale a bone hands to its children: chain x its own pass-on
+            for (size_t b = 0; b < n; ++b) {
+                int p = parents[b];
+                for (int k = 0; k < 3; ++k) {
+                    if (p >= 0 && static_cast<size_t>(p) < b) list->chain[b * 3 + k] = below[static_cast<size_t>(p) * 3 + k];
+                    below[b * 3 + k] = list->chain[b * 3 + k] * passOn[b * 3 + k];
+                }
+            }
+        }
+        e = EnsureBonesHook();
+        if (!e.empty()) return e;
+    }
+    std::lock_guard<std::mutex> lk(g_shapeMx);
+    if (list->bones.empty()) g_shapes.erase(comp);
+    else g_shapes[comp] = std::move(list);
+    g_shapeCount.store(static_cast<int>(g_shapes.size()));
+    return "";
+}
+
+// w3.anim.record: from the next frame on the component's pose is written down (at most maxSeconds at 120 frames a
+// second). Main thread.
+std::string AnimRecordStart(void* comp, float maxSeconds) {
+    FindSkelOffsets();
+    if (!comp || !IsScriptable(comp) || !DerivesFromGuarded(comp, "CAnimatedComponent"))
+        return "an animated figure or component is needed";
+    std::string e = EnsureBonesHook();
+    if (!e.empty()) return e;
+    if (g_qpcFreq == 0) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        g_qpcFreq = static_cast<double>(f.QuadPart);
+    }
+    std::lock_guard<std::mutex> lk(g_recMx);
+    PoseRec& r = g_recs[comp];
+    r = PoseRec();
+    QueryPerformanceCounter(&r.start);
+    r.maxFrames = static_cast<size_t>((maxSeconds > 0 ? maxSeconds : 60.0f) * 120.0f) + 1;
+    g_recCount.store(static_cast<int>(g_recs.size()));
+    return "";
+}
+
+// Stops it and gives the recording at `fps`: the rig's bone names and frames x bones x 10 floats (each value linear
+// between the two frames around its time; the rotation normalised on the nearer side). Main thread.
+std::string AnimRecordStop(void* comp, float fps, std::vector<std::string>* bones, std::vector<float>* out) {
+    PoseRec r;
+    {
+        std::lock_guard<std::mutex> lk(g_recMx);
+        auto it = g_recs.find(comp);
+        if (it == g_recs.end()) return "the figure is not being recorded";
+        r = std::move(it->second);
+        g_recs.erase(it);
+        g_recCount.store(static_cast<int>(g_recs.size()));
+    }
+    if (r.times.size() < 2) return "fewer than two frames were recorded";
+    std::vector<float> rest;
+    std::string e = RigOf(SkeletonPtr(comp), bones, &rest);
+    if (!e.empty()) return e;
+    if (bones->size() != r.n) bones->resize(r.n);  // (the pose's bones are the rig's, in its order)
+    if (!(fps > 0)) fps = 30;
+    double length = r.times.back();
+    size_t frames = static_cast<size_t>(length * fps) + 1, stride = static_cast<size_t>(r.n) * 10, k = 0;
+    out->assign(frames * stride, 0.0f);
+    for (size_t f = 0; f < frames; ++f) {
+        double t = f / static_cast<double>(fps);
+        while (k + 2 < r.times.size() && r.times[k + 1] < t) ++k;
+        double span = r.times[k + 1] - r.times[k];
+        float w = span > 0 ? static_cast<float>((t - r.times[k]) / span) : 0.0f;
+        w = w < 0 ? 0 : w > 1 ? 1 : w;
+        const float* a = r.values.data() + k * stride;
+        const float* b = a + stride;
+        float* o = out->data() + f * stride;
+        for (size_t bone = 0; bone < r.n; ++bone, a += 10, b += 10, o += 10) {
+            for (int c = 0; c < 10; ++c) o[c] = a[c] + (b[c] - a[c]) * w;
+            float dot = a[3] * b[3] + a[4] * b[4] + a[5] * b[5] + a[6] * b[6], len = 0;
+            for (int c = 3; c < 7; ++c) {
+                o[c] = a[c] + ((dot < 0 ? -b[c] : b[c]) - a[c]) * w;
+                len += o[c] * o[c];
+            }
+            if (len > 1e-12f)
+                for (int c = 3; c < 7; ++c) o[c] /= sqrtf(len);
+        }
+    }
+    Log("anim: recorded %zu frames over %.2f s, %u bones, %zu frames at %.0f fps", r.times.size(), length, r.n, frames, fps);
+    return "";
+}
+
 std::string PoseLayerStats() {
     char b[96];
     snprintf(b, sizeof b, "%d figure(s) posed, %llu frame(s)", g_layerCount.load(),

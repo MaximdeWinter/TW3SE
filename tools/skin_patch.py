@@ -418,6 +418,215 @@ def add_vertex_id(lines):
     return eid
 
 
+LOAD_RE = re.compile(r'@dx\.op\.rawBufferLoad\.f32\(i32 139, %dx\.types\.Handle (%[\w.]+), i32 (%[\w.]+|\d+), '
+                     r'i32 (\d+),')
+EXT_RE = re.compile(r'extractvalue %dx\.types\.ResRet\.f32 (%[\w.]+), (\d+)$')
+
+
+def dqs_inputs(body, comps):
+    """What dual quaternion skinning needs of one skinned position (its x, y, z): per bone its weight (the fdiv: weight
+    over the sum) and the four rows of its matrix (rawBufferLoad at 0, 16, 32, 48 bytes: p' = x*r0 + y*r1 + z*r2 + r3),
+    and the local position. {'bones': [(weight, [row0, row1, row2, row3])] x4, 'local': [lx, ly, lz]}, or None."""
+    op = {name: rhs for _, name, rhs in body if name}
+    fdivs = {n for n, r in op.items() if r.startswith('fdiv')}
+    loads = {}
+    for n, r in op.items():
+        m = LOAD_RE.search(r)
+        if m:
+            loads[n] = (m.group(1), m.group(2), int(m.group(3)))
+    # the local position: input row 0 (POSITION), times and plus constant buffer values
+    local = {n for n, r in op.items() if r.startswith('call float @dx.op.loadInput.f32(i32 4, i32 0,')}
+    from_cb = {n for n, r in op.items() if r.startswith('extractvalue %dx.types.CBufRet')}
+    grew = True
+    while grew:
+        grew = False
+        for n, r in op.items():
+            if n in local or not (r.startswith('fmul') or r.startswith('fadd')):
+                continue
+            ops = OPND.findall(r)
+            if ops and any(o in local for o in ops) and all(o in local or o in from_cb for o in ops):
+                local.add(n)
+                grew = True
+
+    def operands(r):
+        if 'dx.op.tertiary.f32(i32 46,' in r:
+            return OPND.findall(r.split('(', 1)[1])[-3:]
+        if r.startswith(('fmul', 'fadd')):
+            return OPND.findall(r)
+        return []
+
+    rmemo = {}
+
+    def reach(n, depth=0):  # the loads n's value is made of (not past a weight or the local position)
+        if n in rmemo:
+            return rmemo[n]
+        r = op.get(n, '')
+        m = EXT_RE.match(r)
+        out = set()
+        if m and m.group(1) in loads:
+            out = {m.group(1)}
+        elif depth < 64 and n not in fdivs and n not in local:
+            for o in operands(r):
+                out |= reach(o, depth + 1)
+        rmemo[n] = out
+        return out
+
+    weight_loads, lpos, seen = {}, {}, set()
+
+    def walk(n, depth=0):
+        if n in seen or depth > 96 or n in fdivs or n in local:
+            return
+        seen.add(n)
+        r = op.get(n, '')
+        ops = operands(r)
+        mul = ops[:2] if 'dx.op.tertiary.f32(i32 46,' in r else (ops if r.startswith('fmul') else [])
+        if len(mul) == 2:
+            a, b = mul
+            for f, other in ((a, b), (b, a)):
+                if f in fdivs:
+                    weight_loads.setdefault(f, set()).update(reach(other))
+            for lv, other in ((a, b), (b, a)):
+                # the local position: a factor made of no bone (the input in a vertex shader, the vertex buffer's
+                # unpacked value in the ray tracing compute shader), times an element of one row of a bone
+                if lv in local or (lv not in fdivs and not reach(lv)):
+                    rows = {loads[c][2] for c in reach(other)}
+                    if len(rows) == 1 and min(rows) // 16 < 3:
+                        lpos.setdefault(min(rows) // 16, lv)
+        for o in ops:
+            walk(o, depth + 1)
+
+    for c in comps:
+        walk(c)
+    if len(weight_loads) != 4 or len(lpos) != 3:
+        return None
+    bones = []
+    for f, calls in weight_loads.items():
+        keys = {(loads[c][0], loads[c][1]) for c in calls}
+        if len(keys) != 1:
+            return None
+        key = keys.pop()
+        rows = {}
+        for c, (h, i, off) in loads.items():
+            if (h, i) == key:
+                rows.setdefault(off, c)
+        if sorted(rows) != [0, 16, 32, 48]:
+            return None
+        bones.append((f, [rows[0], rows[16], rows[32], rows[48]]))
+    return {'bones': bones, 'local': [lpos[0], lpos[1], lpos[2]]}
+
+
+def dqs_code(e, inp):
+    """Dual quaternion skinning (Kavan 2007) of the local position with the four bones: per bone the rotation as a
+    quaternion (its 3x3 part over the bone's mean scale, branch free), the translation as the dual part; blended in
+    the hemisphere of the heaviest bone, normalized, applied; the bones' scales blended linearly. Returns x, y, z."""
+    F = f32hex
+    mul = lambda a, b: e(f'fmul float {a}, {b}')  # noqa: E731
+    add = lambda a, b: e(f'fadd float {a}, {b}')  # noqa: E731
+    sub = lambda a, b: e(f'fsub float {a}, {b}')  # noqa: E731
+    sqrt = lambda a: e(f'call float @dx.op.unary.f32(i32 24, float {a})')  # noqa: E731
+    fmax = lambda a, b: e(f'call float @dx.op.binary.f32(i32 35, float {a}, float {b})')  # noqa: E731
+    sel = lambda c, a, b: e(f'select i1 {c}, float {a}, float {b}')  # noqa: E731
+
+    def dot3(a, b):
+        return add(add(mul(a[0], b[0]), mul(a[1], b[1])), mul(a[2], b[2]))
+
+    def cross(a, b):
+        return [sub(mul(a[1], b[2]), mul(a[2], b[1])), sub(mul(a[2], b[0]), mul(a[0], b[2])),
+                sub(mul(a[0], b[1]), mul(a[1], b[0]))]
+
+    half, one, zero, third, two, tiny = F(0.5), F(1.0), F(0.0), F(1.0 / 3.0), F(2.0), F(1e-8)
+    qs, ds, ws, ts = [], [], [], []
+    ms, rs = [], []
+    for w, rows in inp['bones']:
+        m = [[e(f'extractvalue %dx.types.ResRet.f32 {rows[r]}, {c}') for c in range(3)] for r in range(4)]
+        # the bone's turn: its 3x3 part made orthonormal (Gram-Schmidt on the rows), so a scale, also an uneven one,
+        # gives no turn of its own; what the scale does stays in the game's blend (see below)
+        def unit(v):
+            li = e(f'fdiv float {one}, {fmax(sqrt(dot3(v, v)), tiny)}')
+            return [mul(v[c], li) for c in range(3)]
+
+        u0 = unit(m[0])
+        d01 = dot3(m[1], u0)
+        u1 = unit([sub(m[1][c], mul(d01, u0[c])) for c in range(3)])
+        u2 = cross(u0, u1)
+        R = [u0, u1, u2]
+        a = lambda i, j: R[j][i]  # noqa: E731  (column convention: a_ij = M[j][i])
+        a00, a11, a22 = a(0, 0), a(1, 1), a(2, 2)
+
+        def part(sx, sy, sz):
+            t = add(add(add(one, mul(a00, F(sx))), mul(a11, F(sy))), mul(a22, F(sz)))
+            return mul(sqrt(fmax(t, zero)), half)
+
+        def signed(v, d):
+            neg = e(f'fcmp olt float {d}, {zero}')
+            return sel(neg, sub(zero, v), v)
+
+        qw = part(1, 1, 1)
+        qx = signed(part(1, -1, -1), sub(a(2, 1), a(1, 2)))
+        qy = signed(part(-1, 1, -1), sub(a(0, 2), a(2, 0)))
+        qz = signed(part(-1, -1, 1), sub(a(1, 0), a(0, 1)))
+        qn = sqrt(add(dot3([qx, qy, qz], [qx, qy, qz]), mul(qw, qw)))
+        qi = e(f'fdiv float {one}, {fmax(qn, tiny)}')
+        q = [mul(qx, qi), mul(qy, qi), mul(qz, qi), mul(qw, qi)]
+        t = m[3]
+        # dual part: 0.5 * (t, 0) * q
+        tq = cross(t, q[:3])
+        d = [mul(add(mul(q[3], t[k]), tq[k]), half) for k in range(3)] + [mul(dot3(t, q[:3]), F(-0.5))]
+        qs.append(q)
+        ds.append(d)
+        ws.append(w)
+        ts.append(t)
+        ms.append(m)
+        rs.append(R)
+    # The hemisphere per bone, the same for every vertex: the rest pose's (w >= 0). A choice per vertex (its heaviest
+    # bone) makes steps between neighbours whose heaviest bones differ; this one stays continuous over the mesh and
+    # agrees with signs along the bone chain while no bone is turned half a turn or more from its rest pose.
+    def rotate(q, v):  # v turned by the unit quaternion q
+        cv = cross(q[:3], v)
+        inner = [add(cv[k], mul(q[3], v[k])) for k in range(3)]
+        c2 = cross(q[:3], inner)
+        return [add(v[k], mul(c2[k], two)) for k in range(3)]
+
+    v = inp['local']
+    b0, be, rigid = [zero] * 4, [zero] * 4, [zero] * 3
+    for k in range(4):
+        neg = e(f'fcmp olt float {qs[k][3]}, {zero}')
+        wk = sel(neg, sub(zero, ws[k]), ws[k])
+        b0 = [add(b0[c], mul(wk, qs[k][c])) for c in range(4)]
+        be = [add(be[c], mul(wk, ds[k][c])) for c in range(4)]
+        # the linear blend of the rigid bones (their quaternion and translation): what the bones' scale adds is the
+        # game's blend minus this, kept as it is
+        rv = rotate(qs[k], v)
+        rigid = [add(rigid[c], mul(ws[k], add(rv[c], ts[k][c]))) for c in range(3)]
+    n = sqrt(add(dot3(b0[:3], b0[:3]), mul(b0[3], b0[3])))
+    ni = e(f'fdiv float {one}, {fmax(n, tiny)}')
+    c0 = [mul(b0[c], ni) for c in range(4)]
+    ce = [mul(be[c], ni) for c in range(4)]
+    rot = rotate(c0, v)
+    ct = cross(c0[:3], ce[:3])
+    out = []
+    for k in range(3):
+        tr = mul(add(sub(mul(c0[3], ce[k]), mul(ce[3], c0[k])), ct[k]), two)
+        scaled = sub(inp['lbs'][k], rigid[k]) if inp.get('lbs') else zero
+        out.append(add(add(rot[k], tr), scaled))
+    # the normal's matrix (row form, n' = n . N): the blended turn plus what the bones' scale adds, as for the position
+    x2, y2, z2 = mul(c0[0], c0[0]), mul(c0[1], c0[1]), mul(c0[2], c0[2])
+    xy, xz, yz = mul(c0[0], c0[1]), mul(c0[0], c0[2]), mul(c0[1], c0[2])
+    xw, yw, zw = mul(c0[0], c0[3]), mul(c0[1], c0[3]), mul(c0[2], c0[3])
+    A = [[sub(one, mul(two, add(y2, z2))), mul(two, sub(xy, zw)), mul(two, add(xz, yw))],
+         [mul(two, add(xy, zw)), sub(one, mul(two, add(x2, z2))), mul(two, sub(yz, xw))],
+         [mul(two, sub(xz, yw)), mul(two, add(yz, xw)), sub(one, mul(two, add(x2, y2)))]]
+    N = [[A[j][i] for j in range(3)] for i in range(3)]
+    for k in range(4):
+        for i in range(3):
+            for j in range(3):
+                N[i][j] = add(N[i][j], mul(ws[k], sub(ms[k][i][j], rs[k][i][j])))
+    inp['normal'] = [N[i][j] for i in range(3) for j in range(3)]
+    if os.environ.get('TW3SE_DQS_DEBUG'):  # (a check: the branch taken lifts the mesh by 0.3 m)
+        out[2] = add(out[2], F(0.3))
+    return out
+
+
 def patch_capsules(text):
     """Capsules of the slot of the mesh drawn push its skinned vertices out to their surface (this frame's position
     with this frame's capsules, the previous one's with the previous ones), behind a branch: slot 0 costs nothing."""
@@ -462,6 +671,25 @@ def patch_capsules(text):
             e = Emit(f'p{p}_')
             do, join = f'tw3se_p{p}_do', f'tw3se_p{p}_join'
             start = f'%{do}'
+            # Dual quaternion skinning (the slot's row w, bit 17): the position skinned anew from the same bones and
+            # weights, in place of the game's linear blend; Delta Mush and the capsules work on it
+            dqi = dqs_inputs(body, (x, y, z))
+            bx, by, bz = x, y, z
+            if dqi:
+                qdo, qj = f'tw3se_p{p}_qdo', f'tw3se_p{p}_qj'
+                q0 = e('and i32 %tw3se_cntw, 131072')
+                qon = e(f'icmp ne i32 {q0}, 0')
+                e.lines += [f'  br i1 {qon}, label %{qdo}, label %{qj}', '', f'{qdo}:']
+                dqi['lbs'] = [x, y, z]
+                qx, qy, qz = dqs_code(e, dqi)
+                e.lines += [f'  br label %{qj}', '', f'{qj}:']
+                bx, by, bz = (e(f'phi float [ {qv}, %{qdo} ], [ {ov}, {start} ]') for qv, ov in ((qx, x), (qy, y), (qz, z)))
+                nq = [e(f'phi float [ {nv_}, %{qdo} ], [ 0.000000e+00, {start} ]') for nv_ in dqi['normal']]
+                nqon = e(f'phi i1 [ true, %{qdo} ], [ false, {start} ]')
+                start = f'%{qj}'
+            else:
+                print(f'  dqs: position {p} not understood, left linear', file=sys.stderr)
+            pre = start
             if time == 0:  # Delta Mush: the skinned position out (u15), the mush offset in (t15)
                 dmdo, dmj = f'tw3se_p{p}_dmdo', f'tw3se_p{p}_dmj'
                 on = e('icmp ne i32 %tw3se_dmz, -1')
@@ -471,16 +699,16 @@ def patch_capsules(text):
                 dq = e(f'add i32 {di}, %tw3se_dmw')
                 atq = e(f'shl i32 {dq}, 4')
                 e.lines.append(f'  call void @dx.op.rawBufferStore.f32(i32 140, %dx.types.Handle %tw3se_qh, i32 {atq}, '
-                               f'i32 undef, float {x}, float {y}, float {z}, float 1.000000e+00, i8 15, i32 4)')
+                               f'i32 undef, float {bx}, float {by}, float {bz}, float 1.000000e+00, i8 15, i32 4)')
                 ol = e(f'call %dx.types.ResRet.f32 @dx.op.rawBufferLoad.f32(i32 139, %dx.types.Handle %tw3se_oh, '
                        f'i32 {at}, i32 undef, i8 7, i32 4)')
                 o = [e(f'extractvalue %dx.types.ResRet.f32 {ol}, {k}') for k in range(3)]
-                m = [e(f'fadd float {(x, y, z)[k]}, {o[k]}') for k in range(3)]
+                m = [e(f'fadd float {(bx, by, bz)[k]}, {o[k]}') for k in range(3)]
                 e.lines += [f'  br label %{dmj}', '', f'{dmj}:']
                 merged = []
-                for k, (old, new_) in enumerate(zip((x, y, z), m)):
+                for k, (old, new_) in enumerate(zip((bx, by, bz), m)):
                     name = f'%tw3se_p{p}_dm{"xyz"[k]}'
-                    e.lines.append(f'  {name} = phi float [ {new_}, %{dmdo} ], [ {old}, %{do} ]')
+                    e.lines.append(f'  {name} = phi float [ {new_}, %{dmdo} ], [ {old}, {pre} ]')
                     merged.append(name)
                 cx, cy, cz = merged
                 start = f'%{dmj}'
@@ -493,12 +721,12 @@ def patch_capsules(text):
                 ol = e(f'call %dx.types.ResRet.f32 @dx.op.rawBufferLoad.f32(i32 139, %dx.types.Handle %tw3se_oh, '
                        f'i32 {at}, i32 undef, i8 7, i32 4)')
                 o = [e(f'extractvalue %dx.types.ResRet.f32 {ol}, {k}') for k in range(3)]
-                m = [e(f'fadd float {(x, y, z)[k]}, {o[k]}') for k in range(3)]
+                m = [e(f'fadd float {(bx, by, bz)[k]}, {o[k]}') for k in range(3)]
                 e.lines += [f'  br label %{dmj}', '', f'{dmj}:']
                 merged = []
-                for k, (old, new_) in enumerate(zip((x, y, z), m)):
+                for k, (old, new_) in enumerate(zip((bx, by, bz), m)):
                     name = f'%tw3se_p{p}_dm{"xyz"[k]}'
-                    e.lines.append(f'  {name} = phi float [ {new_}, %{dmdo} ], [ {old}, %{do} ]')
+                    e.lines.append(f'  {name} = phi float [ {new_}, %{dmdo} ], [ {old}, {pre} ]')
                     merged.append(name)
                 cx, cy, cz = merged
                 start = f'%{dmj}'
@@ -520,6 +748,10 @@ def patch_capsules(text):
                 rename[v] = f'%tw3se_p{p}{c}'
             for c, pv in zip('xyz', pushes):
                 out.append(f'  %tw3se_p{p}d{c} = phi float [ {pv}, {last} ], [ 0.000000e+00, {block} ]')
+            if dqi:  # the DQS normal matrix and whether it holds (dqs_normals)
+                for i, nv_ in enumerate(nq):
+                    out.append(f'  %tw3se_p{p}N{i} = phi float [ {nv_}, {last} ], [ 0.000000e+00, {block} ]')
+                out.append(f'  %tw3se_p{p}Nq = phi i1 [ {nqon}, {last} ], [ false, {block} ]')
             pred_map[block] = f'%{join}'
             block = f'%{join}'
     # the constant buffers, the weights, the vertex id; the slot and the counts at the function's start
@@ -563,6 +795,7 @@ def patch_capsules(text):
         '  %tw3se_slot = select i1 %tw3se_big, i32 0, i32 %tw3se_slot0',
         '  %tw3se_cnt = call %dx.types.CBufRet.i32 @dx.op.cbufferLoadLegacy.i32(i32 59, %dx.types.Handle %tw3se_cb, '
         'i32 %tw3se_slot)',
+        '  %tw3se_cntw = extractvalue %dx.types.CBufRet.i32 %tw3se_cnt, 3',
         f'  %tw3se_capb0 = mul i32 %tw3se_slot, {CAPS * CAP_ROWS * 2}',
         f'  %tw3se_capbase = add i32 %tw3se_capb0, {CAP_ROW0}',
     ]
@@ -696,6 +929,41 @@ def cap_normals(text):
         if any(defs[v][0] >= first for col in cols for v in col):
             continue
         e = Emit('cn_')
+        # dual quaternion skinning (patch_capsules): the normal from the slot's DQS matrix, n . N, into the world with
+        # LocalToWorld's columns, in place of the game's while the slot has it on
+        def load_of(v):  # the NORMAL input read behind n * 2 - 1
+            d = defs.get(v, (0, ''))[1]
+            m = re.match(r'fadd fast float (%[\w.]+), -1\.000000e\+00$', d)
+            if m:
+                m2 = re.match(r'fmul fast float (%[\w.]+), 2\.000000e\+00$', defs.get(m.group(1), (0, ''))[1])
+                return m2.group(1) if m2 else None
+            m = re.match(r'call float @dx\.op\.tertiary\.f32\(i32 46, float (%[\w.]+), float 2\.000000e\+00, ', d)
+            return m.group(1) if m else None
+
+        nl = [None] * 3
+        for v in ns[0]:
+            lv = load_of(v)
+            cm = lv and re.search(r', i8 (\d),', defs.get(lv, (0, ''))[1])
+            if cm and int(cm.group(1)) < 3:
+                nl[int(cm.group(1))] = v
+        nvx = list(nv)
+        if '%tw3se_p0Nq' in text and None not in nl and defs.get('%tw3se_p0Nq', (1 << 30,))[0] < first:
+            Nm = [[f'%tw3se_p0N{i * 3 + j}' for j in range(3)] for i in range(3)]
+            nmod = []
+            for j in range(3):
+                v = e(f'fmul fast float {nl[0]}, {Nm[0][j]}')
+                v = e(f'call float @dx.op.tertiary.f32(i32 46, float {nl[1]}, float {Nm[1][j]}, float {v})')
+                nmod.append(e(f'call float @dx.op.tertiary.f32(i32 46, float {nl[2]}, float {Nm[2][j]}, float {v})'))
+            nw = []
+            for c in range(3):
+                v = e(f'fmul fast float {cols[c][0]}, {nmod[0]}')
+                v = e(f'call float @dx.op.tertiary.f32(i32 46, float {cols[c][1]}, float {nmod[1]}, float {v})')
+                nw.append(e(f'call float @dx.op.tertiary.f32(i32 46, float {cols[c][2]}, float {nmod[2]}, float {v})'))
+            nd = e(f'call float @dx.op.dot3.f32(i32 55, float {nw[0]}, float {nw[1]}, float {nw[2]}, float {nw[0]}, '
+                   f'float {nw[1]}, float {nw[2]})')
+            nr = e(f'call float @dx.op.unary.f32(i32 25, float {e(f"call float @dx.op.binary.f32(i32 35, float {nd}, float {f32hex(1e-12)})")})')
+            nvx = [e(f'select i1 %tw3se_p0Nq, float {e(f"fmul fast float {nw[c]}, {nr}")}, float {nv[c]}')
+                   for c in range(3)]
         dpush = ['%tw3se_p0dx', '%tw3se_p0dy', '%tw3se_p0dz']
         dw = []
         for c in range(3):
@@ -709,16 +977,16 @@ def cap_normals(text):
         w = e(f'call float @dx.op.unary.f32(i32 7, float {w})')  # saturate
         dm = e(f'call float @dx.op.binary.f32(i32 35, float {dd}, float {f32hex(1e-12)})')
         rs = e(f'call float @dx.op.unary.f32(i32 25, float {dm})')
-        sd = e(f'call float @dx.op.dot3.f32(i32 55, float {dw[0]}, float {dw[1]}, float {dw[2]}, float {nv[0]}, '
-               f'float {nv[1]}, float {nv[2]})')
+        sd = e(f'call float @dx.op.dot3.f32(i32 55, float {dw[0]}, float {dw[1]}, float {dw[2]}, float {nvx[0]}, '
+               f'float {nvx[1]}, float {nvx[2]})')
         neg = e(f'fcmp fast olt float {sd}, {f32hex(0.0)}')
         sg = e(f'select i1 {neg}, float {f32hex(-1.0)}, float {f32hex(1.0)}')
         rs = e(f'fmul fast float {rs}, {sg}')
         t = []
         for c in range(3):
             tc = e(f'fmul fast float {dw[c]}, {rs}')
-            df = e(f'fsub fast float {tc}, {nv[c]}')
-            t.append(e(f'call float @dx.op.tertiary.f32(i32 46, float {df}, float {w}, float {nv[c]})'))
+            df = e(f'fsub fast float {tc}, {nvx[c]}')
+            t.append(e(f'call float @dx.op.tertiary.f32(i32 46, float {df}, float {w}, float {nvx[c]})'))
         tt = e(f'call float @dx.op.dot3.f32(i32 55, float {t[0]}, float {t[1]}, float {t[2]}, float {t[0]}, '
                f'float {t[1]}, float {t[2]})')
         tr = e(f'call float @dx.op.unary.f32(i32 25, float {tt})')
@@ -960,9 +1228,49 @@ def patch_rt(text):
             'i32 %tw3se_slot)',
             f'  %tw3se_capb0 = mul i32 %tw3se_slot, {CAPS * CAP_ROWS * 2}',
             f'  %tw3se_capbase = add i32 %tw3se_capb0, {CAP_ROW0}',
+            '  %tw3se_cntw = extractvalue %dx.types.CBufRet.i32 %tw3se_cnt, 3',
         ]
         e = Emit('rt_')
-        nx, ny, nz, last = capsule_code(e, px, py, pz, 0, '%tw3se_rt_do')
+        # dual quaternion skinning, as in the vertex shaders (the slot's row w, bit 17)
+        # The stored position is the skinned one S, or a blend B + t * (S - B) with a position B of another source:
+        # the DQS position goes in for S (final + t * (DQS - S)).
+        op = {name: rhs for _, name, rhs in body if name}
+
+        def lerp_parts(v):
+            m = re.match(r'fadd (?:fast )?float (%[\w.]+), (%[\w.]+)$', op.get(v, ''))
+            for x, b in ((m.group(1), m.group(2)), (m.group(2), m.group(1))) if m else ():
+                mm = re.match(r'fmul (?:fast )?float (%[\w.]+), (%[\w.]+)$', op.get(x, ''))
+                for t, d in ((mm.group(1), mm.group(2)), (mm.group(2), mm.group(1))) if mm else ():
+                    md = re.match(r'fsub (?:fast )?float (%[\w.]+), (%[\w.]+)$', op.get(d, ''))
+                    if md and md.group(2) == b:
+                        return md.group(1), t
+            return v, None
+
+        parts = [lerp_parts(v) for v in (px, py, pz)]
+        skin = [s for s, _ in parts]
+        ts = {t for _, t in parts}
+        start, cx, cy, cz = '%tw3se_rt_do', px, py, pz
+        dqi = dqs_inputs(body, skin) if len(ts) == 1 else None
+        if dqi:
+            dqi['lbs'] = skin
+            tmix = ts.pop()
+            q0 = e('and i32 %tw3se_cntw, 131072')
+            qon = e(f'icmp ne i32 {q0}, 0')
+            e.lines += [f'  br i1 {qon}, label %tw3se_rt_qdo, label %tw3se_rt_qj', '', 'tw3se_rt_qdo:']
+            qv = dqs_code(e, dqi)
+            fin = []
+            for c, (v, s) in enumerate(zip((px, py, pz), skin)):
+                d = e(f'fsub float {qv[c]}, {s}')
+                if tmix:
+                    d = e(f'fmul float {d}, {tmix}')
+                fin.append(e(f'fadd float {v}, {d}'))
+            e.lines += ['  br label %tw3se_rt_qj', '', 'tw3se_rt_qj:']
+            cx, cy, cz = (e(f'phi float [ {nv_}, %tw3se_rt_qdo ], [ {ov}, {start} ]')
+                          for nv_, ov in zip(fin, (px, py, pz)))
+            start = '%tw3se_rt_qj'
+        else:
+            print('  dqs: the ray tracing skinning not understood, left linear', file=sys.stderr)
+        nx, ny, nz, last = capsule_code(e, cx, cy, cz, 0, start)
         out += ['  %tw3se_rt_go = icmp ne i32 %tw3se_slot, 0',
                 '  br i1 %tw3se_rt_go, label %tw3se_rt_do, label %tw3se_rt_join', '', 'tw3se_rt_do:']
         out += e.lines

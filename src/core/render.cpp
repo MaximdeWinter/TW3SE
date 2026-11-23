@@ -105,9 +105,21 @@ SetRs_t g_trRs[kVariants];
 SetRs_t g_trCrs[kVariants];
 Reset_t g_trReset[kVariants];
 
+// 19.11.: the trace of the pipelines a few frames set (w3._pso_trace): how often each, written to a file at the end
+std::atomic<int> g_traceFrames{0};
+std::mutex g_traceMx;
+std::unordered_map<void*, uint64_t> g_traceCounts;
+std::wstring g_tracePath;
+void TraceCount(void* pso) {
+    if (g_traceFrames.load(std::memory_order_relaxed) <= 0 || !pso) return;
+    std::lock_guard<std::mutex> l(g_traceMx);
+    ++g_traceCounts[pso];
+}
+
 template <int K>
 void STDMETHODCALLTYPE SetPsoHook(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* pso) {
     g_trPso[K](cl, pso);
+    TraceCount(pso);
     bool skin = SkinHookOn();
     if (!g_any.load(std::memory_order_relaxed) && !skin) return;
     ListState& st = t_lists[cl];
@@ -353,7 +365,38 @@ int RenderOnSubmit(TW3SE_SubmitCallback cb, void* ctx) {
     g_submit.push_back({cb, ctx});
     return 1;
 }
-void RenderOnPresent() { g_frameStart = true; }
+std::string ShadersPsoNote(void* pso);
+void TraceWrite() {
+    std::unordered_map<void*, uint64_t> counts;
+    std::wstring path;
+    {
+        std::lock_guard<std::mutex> l(g_traceMx);
+        counts.swap(g_traceCounts);
+        path = g_tracePath;
+    }
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"w") || !f) return;
+    for (const auto& c : counts)
+        fprintf(f, "%llu %p %s\n", static_cast<unsigned long long>(c.second), c.first, ShadersPsoNote(c.first).c_str());
+    fclose(f);
+    Log("render: pipeline trace of %zu pipelines written", counts.size());
+}
+void RenderOnPresent() {
+    g_frameStart = true;
+    if (g_traceFrames.load(std::memory_order_relaxed) > 0 && g_traceFrames.fetch_sub(1) == 1) TraceWrite();
+}
+// 19.11.: the pipelines the next `frames` frames set, to `path` (count, pipeline, its note a line)
+bool RenderPsoTrace(int frames, const std::wstring& path) {
+    if (frames <= 0 || g_traceFrames.load() > 0) return false;
+    Want();
+    {
+        std::lock_guard<std::mutex> l(g_traceMx);
+        g_traceCounts.clear();
+        g_tracePath = path;
+    }
+    g_traceFrames = frames;
+    return true;
+}
 uint64_t RenderSubmitFrames() { return g_submits.load(); }
 void RenderBeforeSubmit(void* queue, void* gameQueue) {
     // the queue the game presents with (latched at its first Present): Streamline's own queues refuse other work

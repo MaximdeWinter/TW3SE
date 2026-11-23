@@ -349,8 +349,43 @@ the right slot. Up to 64 slots can be hooked, one handler each.
 
 ### Engine functions by name
 
-`w3.engine_hook(name, fn)` runs `fn` before an engine function of TW3SE's address list (the names plugins pass to
-`GetAddress`). `a[1]` to `a[4]` are its register arguments (`rcx`, `rdx`, `r8`, `r9`) as integers, `a[5]` to `a[8]`
+An engine function has one of these names:
+
+- a name of TW3SE's address list (the names plugins pass to `GetAddress`): `"CDrawableComponent::RefreshRenderProxies"`
+- a slot of a class's vtable: `"CEntity::vf140"`, or `"CEntity::vf0@10"` for the vtable at offset 0x10 of the
+  object. TW3SE finds the class by its name in witcher3.exe, so the name holds after a patch as long as the class
+  keeps its slots
+- an offset in witcher3.exe: `"0x2263570"` or `"witcher3.exe+0x2263570"`
+
+`tools/enginemap.py` (in the SDK) lists every class of the exe with its slots and names what TW3SE knows of them:
+`python tools/enginemap.py class CEntity`.
+
+```lua
+w3.engine_addr("CEntity::vf140")     -- the function's offset in witcher3.exe, or nil and why
+```
+
+`w3.engine_call(fn, sig, ...)` calls an engine function. `fn` is a name as above or an offset (as `w3.vslot` and
+`w3.engine_addr` give it). `sig` has one letter for each argument, then `>` and the letter of the result:
+
+| Letter | Argument | Result |
+|---|---|---|
+| `i` | an integer | an integer |
+| `p` | an object, an address or `nil` | an address |
+| `s` | a string (lives until the call returns) | the string at the returned address |
+| `b` | a boolean | a boolean |
+| `f`, `d` | a number as a float or a double | a number |
+| `o` | | the object at the returned address |
+| `v` | | nothing |
+
+```lua
+local cls = w3.engine_call(w3.vslot(w3.player(), 1), "p>p", w3.player())    -- the player's GetClass
+local y = w3.engine_call("0x14fe8a0", "pf>f", nil, 2.5)                       -- 2.5
+```
+
+Up to 16 arguments. The function runs on the main thread. A fault inside it ends the call with a Lua error, and the
+game goes on. Arguments the function does not expect (a wrong `sig`) can crash the game.
+
+`w3.engine_hook(name, fn)` runs `fn` before an engine function. `a[1]` to `a[4]` are its register arguments (`rcx`, `rdx`, `r8`, `r9`) as integers, `a[5]` to `a[8]`
 the next four from the stack (as many as the function has), `a.name` the name. A table the function returns puts
 new values into the four registers. The engine function always runs.
 
@@ -434,6 +469,14 @@ w3.files.alias([[characters\npc_entities\monsters\wraith_lvl1.w2ent]],
                [[characters\npc_entities\monsters\wraith_mine.w2ent]])
 local t = w3.load([[characters\npc_entities\monsters\wraith_mine.w2ent]])   -- another template than the game's
 ```
+
+`w3.files.set(path, bytes)` gives a file new contents for this session, from memory. The next load of the file reads
+them; what is already in the world keeps the old version. A new path becomes a new file of the game (its folder
+has to exist in the game). `w3.files.clear(path)` brings back the game's own contents. Both return true, or
+nil and the reason.
+
+A loose file put into `tw3se\files\` while the game runs is a new file of the game the same way (see
+[Loose files](manual/loose-files.md)).
 
 `w3.attach(entity, template)` puts the components of a template onto an entity in the world, the way the game adds
 the parts of an appearance. `w3.detach(entity, template)` takes them off. The entity needs a `CAppearanceComponent`
@@ -615,8 +658,19 @@ game's item XML (`gameplay\items\*.xml`, `tools\bundle_extract.py` copies them o
 any other attribute. A stat as a plain number is an `add` (`quality = 5`). `text` and `description` are the name
 and the description in the game, a table by language too.
 
-TW3SE writes the items of every mod into a DLC of its own (`tw3se\files\dlc\dlctw3se\`) and packs it at the next
-start. The game has the items from the next start on: `w3.inv.add("mymod_swallow_plus_potion")`.
+The item is in the game at once: `w3.inv.add("mymod_swallow_plus_potion")`. A second call with the same name changes
+it (a new price, other abilities). TW3SE writes the items of every mod into a DLC of its own
+(`tw3se\files\dlc\dlctw3se\`) as well, and from the next start on the game loads them from there.
+
+`w3.items.mount(path)` loads an item XML of your own while the game runs, in the format of the game's
+`gameplay\items\*.xml`. The path is a depot path, for example a loose file in `tw3se\files\` or a file made with
+`w3.files.set`. It returns a handle, or nil and the reason. `w3.items.unmount(handle)` takes the definitions away
+again. Items already in an inventory stay there.
+
+```lua
+w3.files.set([[gameplay\items\mymod_items.xml]], w3.fs.read(w3.dir() .. [[\mymod_items.xml]]))
+local m = w3.items.mount([[gameplay\items\mymod_items.xml]])
+```
 
 Caution: a save that holds such an item loses it when the mod is gone.
 
@@ -721,6 +775,10 @@ textures as their resource). A material belongs to its mesh, so a change counts 
 shows on the entities that appear after the change (a new spawn, objects loaded as you travel). An entity on screen
 keeps the values it was made with until `w3.material.apply(entity)` draws its meshes anew.
 
+`w3.material.own(entity)` gives one entity materials of its own: each of its mesh components gets its mesh loaded a
+second time, with its own material instances, so `w3.material.set` on them changes this entity only (a skin colour
+for one figure). It returns how many meshes became its own. HairWorks fur (`CFurComponent`) keeps the shared ones.
+
 `w3.refresh(component)` draws one component anew from its current data. It returns false for a component outside
 the world.
 
@@ -762,6 +820,53 @@ falling over.
 These work on entities with a body the game simulates (`w3.physics.bodies(entity)` lists them): crates, barrels and
 other loose objects, near the player and while the game runs. `w3.physics.collisions(actor, false)` lets an actor
 walk through others, `w3.physics.kinematic(entity, false)` hands it to the physics.
+
+### Bodies of your own
+
+```lua
+local p = w3.player():GetWorldPosition()
+local box = w3.physics.body{shape = "box", size = 0.5, mass = 10, pos = {p.X + 1.5, p.Y, p.Z + 2}}
+local ball = w3.physics.body{shape = "sphere", radius = 0.2, mass = 2, pos = {p.X - 1.5, p.Y, p.Z + 1}}
+w3.physics.push(ball, {0, 10, 0}, "velocity")
+local hand = w3.physics.body{shape = "capsule", radius = 0.05, height = 0.2, kinematic = true, pos = p}
+w3.physics.move(hand, {p.X, p.Y, p.Z + 1})          -- each frame, to follow a bone: it pushes what it meets
+print(w3.physics.pose(box).pos.Z)
+w3.physics.remove(box)                                -- w3.physics.clear() takes all of them out
+```
+
+`w3.physics.body(opts)` puts a body of its own into the world's physics: `shape` `"box"` (`size` the full size, one
+number or `{x, y, z}`), `"sphere"` (`radius`) or `"capsule"` (`radius`, `height`, along X), `pos`, `rot` (a quaternion
+`{x, y, z, w}`), `mass` (10), `friction` (0.5), `bounce` (0.1). It collides like the game's loose objects. A
+`kinematic` body moves only where `w3.physics.move` sends it and pushes the bodies in its way, a `static` one stays.
+
+`w3.physics.pose(body)` gives `{pos, rot}`, `w3.physics.move(body, pos, rot)` moves it, `w3.physics.push(body, v,
+mode)` adds a force (`"force"`, `"impulse"`, `"velocity"`, `"acceleration"`), `w3.physics.speed(body [, v])` gives
+or sets its speed. The bodies have no mesh: to see one, place an object of the game where it is each frame. A body
+stays in the world until `w3.physics.remove`, `w3.physics.clear` or the next load of a save.
+
+```lua
+local rope = w3.physics.joint("rope", anchor, ball, {length = 1})            -- at most 1 m apart
+local pin  = w3.physics.joint("ball", nil, box, {at = {x, y, z}})            -- hangs at a point of the world
+local weld = w3.physics.joint("fixed", a, b, {break_force = 500})            -- breaks above 500 N
+w3.physics.unjoint(rope)
+```
+
+`w3.physics.joint(kind, a, b, opts)` joins two bodies: `"ball"` (turns freely), `"hinge"`, `"fixed"`, `"slider"` and
+`"rope"`. `a` and `b` are bodies of `w3.physics.body`, the address of a PhysX actor, or `nil` for the world. The joint
+sits at `opts.at` (a point of the world; default: where `b` is). A rope runs from the middle of one body to the
+middle of the other (or `opts.at_a`, `opts.at_b`), at most `opts.length` long (default: the distance now);
+`opts.stiffness` and `opts.damping` make it a spring. `opts.break_force` lets the joint break above that force.
+`w3.physics.clear` takes the joints out too.
+
+`w3.physics.parts(actor)` gives the bodies of a figure by bone name (`pelvis`, `head`, `l_hand`, `r_foot`, ...). They
+move with the figure's animation, also after its death. `w3.physics.pose` reads them, and a joint holds a body of
+your own to them:
+
+```lua
+local hand = w3.physics.parts(npc).r_hand
+local lamp = w3.physics.body{shape = "sphere", radius = 0.1, mass = 2, pos = w3.physics.pose(hand).pos}
+w3.physics.joint("rope", hand, lamp, {length = 0.5})
+```
 
 ## Animation and figures
 
@@ -851,6 +956,126 @@ that leaves the world keeps its entry until `pose_clear`.
 A figure's container also holds the sets a scene pushed onto it, some of them made for another skeleton. Sampled on
 this figure, such an animation gives a broken pose (a hand a metre behind the back): the sampler writes
 bones in the order of the skeleton the set was made for.
+
+### A figure's parts
+
+```lua
+for _, part in ipairs(w3.figure.parts(w3.player())) do print(part.item, part.name, part.mesh) end
+local crown = w3.figure.part(w3.player(), "crown")       -- by component name or a piece of its mesh path
+w3.figure.show(crown, false)                             -- off; true brings it back
+w3.figure.mesh(w3.figure.part(w3.player(), "gloves"), [[characters\models\geralt\armor\armor__viper\s_01_mg__viper.w2mesh]])
+```
+
+`w3.figure.parts(actor)` lists the mesh parts of a figure and of its mounted items (head, hair, armour pieces), each
+`{component, name, mesh, item, visible}`. `w3.figure.show(part, on)` turns a part on or off, `w3.figure.mesh(part,
+mesh)` gives it another mesh (a path or a `CMesh`). A part that follows the skeleton takes any mesh made for the same
+skeleton: the bones are matched anew by name.
+
+`w3.figure.add(actor, what)` gives a figure a new part that follows its skeleton. `what` is a mesh path (`.w2mesh`),
+a template path (`.w2ent`, an item's for example) or a `CEntityTemplate`. It returns a handle and the new parts, in
+the form of `w3.figure.parts`. `w3.figure.remove(handle)` takes the part off. A part lasts until the next load of a save.
+
+```lua
+local h = w3.figure.add(w3.player(), [[items\bodyparts\geralt_items\gloves\witcher_viper\g_01_mg__viper_lvl3.w2ent]])
+w3.figure.remove(h)
+```
+
+The colours of an item are in its template. A mesh path alone draws a mesh with a colour mask in red.
+
+`w3.figure.look(actor)` gives the look your mods gave a figure as a plain table: the shapes of body and face, the
+parts turned off or given another mesh, and the added parts. `w3.figure.apply(actor, look)` puts it on a figure
+again, after a save load for example, and returns the handles of the added parts.
+
+```lua
+local s = w3.store("mylooks")
+s.geralt = w3.figure.look(w3.player())
+-- later
+w3.figure.apply(w3.player(), w3.store("mylooks").geralt)
+```
+
+`w3.figure.preview(actor, opts)` points the free camera at a figure from the front and puts a light of its own beside
+the camera, for a character editor. `opts`: `yaw` (degrees around the figure), `distance` (2.5 m), `height` (the
+point looked at, 1.2 m above the feet), `lift` (the camera higher by that), `fov`, `light = false`, `color`,
+`brightness`. A second call moves the view. `w3.figure.preview_end()` gives the game's camera back.
+
+```lua
+w3.figure.preview(w3.player(), {yaw = 30, distance = 1.0, height = 1.65, fov = 40})   -- the face
+w3.figure.preview_end()
+```
+
+### Animations made at run time
+
+```lua
+w3.anim.create(w3.player(), "my_wave", {fps = 30, bones = {"r_shoulder", "r_bicep"}, frames = {
+    {{rot = {0, 0, 0, 1}}, {}},                        -- frame 1: the shoulder turned, the bicep as at rest
+    {{rot = {0, 0, 0.7071, 0.7071}}, {rot = {0.5, 0, 0, 0.866}}},
+}})
+local h = w3.anim.run(w3.player(), "my_wave", {loop = true, speed = 1, weight = 1})
+w3.anim.stop(h)
+```
+
+`w3.anim.create(actor, name, anim)` makes an animation for the actor's rig, without cooking. Each frame has one
+entry per name in `bones`, each `{pos = {x, y, z}, rot = {x, y, z, w}, scale = {x, y, z}}` local to the bone's
+parent. What an entry leaves out takes the rig's rest pose, so a rotation alone keeps the bone in its place. Bones
+the rig lacks are left out, and the rig's bones the animation does not name keep the figure's own pose. It returns
+how many of the bones are in the rig. `raw` in place of `frames` takes the frames as one string of float32 values,
+10 per bone (position xyz, rotation xyzw, scale xyz; NaN takes the rest pose's value), for animations read from a
+file.
+
+The animation is the engine's own kind (an uncompressed animation buffer), and the engine samples it. It goes into
+a set of its own in the figure's animation sets, so everything that looks an animation up by name on that figure
+finds it: `w3.anim.play` (a slot animation), `w3.anim.pose`, `w3.anim.sample`, `w3.anim.run`. A second `create` with
+the same name replaces it.
+
+`w3.anim.run(actor, name, opts)` plays an animation of the figure, made or the game's, as a pose layer:
+`loop` (default true), `speed`, `weight`. Without loop it ends by itself at the end.
+
+### Proportions
+
+```lua
+w3.anim.shape(w3.player(), {
+    Root    = {scale = 1.1, inherit = true},   -- the whole figure 10 % taller
+    r_bicep = {scale = 1.2, only = true},      -- a thicker upper arm, the forearm and the hand as they were
+    r_hand  = {length = 1.1},                  -- a longer forearm: the hand 10 % further from the elbow
+    head    = {scale = 0.95},
+})
+w3.anim.shape(w3.player(), {})                 -- back to the figure's own
+```
+
+`w3.anim.shape(actor, bones)` changes the figure's bones every frame, after its animation: per bone name `scale` (one
+number or `{x, y, z}`), `offset` (`{x, y, z}` in the parent's space), `rot` (a quaternion `{x, y, z, w}` after the
+bone's own turn) and `length` (the bone's distance to its parent times this). Every mesh, hair and dangle follows.
+A scale makes the bones below the bone as big as well and leaves them in their places. `inherit = true` also moves
+them apart, so the whole part grows evenly. `only = true` keeps the scale on the bone itself. A call replaces the
+figure's last shape; a bone the rig lacks is an error.
+
+`w3.anim.bones(actor)` lists the bone names of a figure's rig. A face has a rig of its own in the head's
+`CMimicComponent` (Geralt's has 180 bones: `nose`, `chin`, `jaw`, `left_eye`, `left_chick1`, `upper_lip`, ...), and
+`w3.anim.shape` on that component shapes the face. The face's expressions and lip sync go on as before.
+
+```lua
+local face
+for _, p in ipairs(w3.figure.parts(w3.player())) do
+  local e = p.component:GetEntity()
+  face = face or (e:GetComponentsByClassName("CMimicComponent") or {})[1]
+end
+print(table.concat(w3.anim.bones(face), ", "))
+w3.anim.shape(face, {nose = {scale = 1.2}, chin = {offset = {0, 0.01, 0}}, left_eye = {scale = 1.1}, right_eye = {scale = 1.1}})
+```
+
+### Recording
+
+```lua
+w3.anim.record(w3.player(), 30)                          -- at most 30 seconds
+-- ... the figure moves: the game, a scene, w3.anim.pose ...
+local a = w3.anim.record_stop(w3.player(), 30)          -- {fps, bones, raw} at 30 frames a second
+w3.anim.save(w3.fs.folder("tw3se") .. "\\wave.tw3anim", a)
+w3.anim.create(npc, "wave", w3.anim.load(w3.fs.folder("tw3se") .. "\\wave.tw3anim"))
+```
+
+`w3.anim.record(actor, maxSeconds)` writes the figure's pose down every frame from the next frame on, whatever moves
+it. `w3.anim.record_stop(actor, fps)` ends it and gives the recording at a fixed rate, with every bone of the rig, as
+`w3.anim.create` takes it. `w3.anim.save(path, anim)` and `w3.anim.load(path)` keep it as a file.
 
 ## Drawing over the world
 

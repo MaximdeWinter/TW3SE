@@ -132,6 +132,10 @@ CALL("Memory::Free", "funcLogChannel", 0xc1, "E8 ?? ?? ?? ?? 48 8B 5C 24 40")
 FUNC_OPT("RenderResize::FreeOld", 0x02457177, "49 8B CF E8 ?? ?? ?? ?? 4C 8B BC 24 C8 00 00 00 48 81 C4 00 01 00 00")
 // its call from the render-size change (+0x232d968): only frees under this call count
 FUNC_OPT("RenderResize::Call", 0x0232dab4, "48 8D 4E 78 E8 ?? ?? ?? ?? 48 8D 4E 78")
+// a node's attachment list (16-byte cells {value, next}): its remove and its append (attachfix.cpp, 20.11.: a
+// worker thread and the main thread changed one at the same time)
+FUNC_OPT("AttachList::Remove", 0x00871760, "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B 19 48 8B F1 48 85 DB 74 17 48 8B 02 0F 1F 00 48 8B 7B 08 48 39 03 74 1A 48 8B DF 48 85 FF 75 EF 32 C0 48 8B 5C 24 30")
+FUNC_OPT("AttachList::Append", 0x004be270, "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 30 48 8B DA 48 8B F1 BA 10 00 00 00 48 8D 4C 24 20 E8 ?? ?? ?? ?? 48 8B 7C 24 20 33 D2 4C 8B 44 24 28")
 CALL("Memory::AllocDefault", "RegisterNative_CPPForceActorLOD", 0x16, "E8 ?? ?? ?? ?? 48 8B 5C 24 20")
 GLOBAL("GContentManager", "CContentManager::LoadModioMods", 0x24, 3, 7, "4C 8B 35 ?? ?? ?? ?? 4C 89 75 60")
 GLOBAL("GGame", "CModHandlerSystem::LoadModsIntoGameSystems", 0x119, 3, 7, "48 8B 05 ?? ?? ?? ?? 48 85 C0 74 ?? 80 B8 10 01 00 00 00")
@@ -357,8 +361,10 @@ FUNC_OPT("SBehaviorGraphOutput::GetBonesModelSpace", 0x02494920, "48 89 5C 24 08
 // GetBonesModelSpace into bonesMS, then ragdoll and pose constraints. Reference
 FUNC_OPT("CAnimatedComponent::UpdatePoseFromBehavior", 0x0242ccd0, "48 8B C4 53 48 81 EC F0 00 00 00 48 89 68 10")
 // (container, const CName*) -> CSkeletalAnimationSetEntry*: the lookup by name (88 callers); the animation is at
-// entry + 0x20. Locks internally. A twin with another table follows it, hence the long signature
-FUNC_OPT("CSkeletalAnimationContainer::FindAnimation", 0x0241cf20, "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 30 48 8B 3D ?? ?? ?? ?? 33 ED 48 8B DA 48 8B F1 48 85 FF 75 ?? BA 38 00 00 00 48 8D 4C 24 20 E8 ?? ?? ?? ?? 48 8B 7C 24 20 33 D2 4C 8B 44 24 28 48 8B CF E8 ?? ?? ?? ?? 48 85 FF 74 ?? 48 8B CF FF 15 ?? ?? ?? ?? 48 89 6F 08 48 89 6F 10 48 89 6F 18 48 89 6F 20 48 89 6F 28 40 88 6F 30 39 6F 08 74 ?? 33 C9 E8 ?? ?? ?? ?? 48 89 6F 08 EB ?? 48 8B FD 48 89 3D ?? ?? ?? ?? 48 8B CF FF 15 ?? ?? ?? ?? 39 6F 0C 74 ?? 44 8B 03 33 D2 41 8B C0 F7 77 08 48 8B 47 28 48 8B 14 D0 48 85 D2 74 ?? 44 39 42 10 75 ?? 44 39 02 74 ?? 48 8B 52 18 48 85 D2 75 ?? 48 8B CF FF 15 ?? ?? ?? ?? 33 C0 48 8B 5C 24 40 48 8B 6C 24 48 48 8B 74 24 50 48 83 C4 30 5F C3 48 8D 4A 08 48 85 C9 74 ?? 48 8B 09 48 85 C9 74 ?? 4C 8B 4E 58 8B 46 60 4D 8D 04 C1 4D 3B C1 74 ?? 49 8B 50 F8 49 83 E8 08 48 8B D9 48 85 D2 74 ?? 48 8B 42 08 EB ?? 48 8B C5 48 3B 43 18 74 ?? 48 8B 5B 48 48 85 DB 75 ?? EB ?? 48 8B CF FF 15 ?? ?? ?? ?? 48 8B C3 EB ?? CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC 48 89 5C 24 08")
+// entry + 0x20. Locks internally. A twin with another table follows it, the same bytes but for its addresses: the
+// signature is the function, its padding and the twin's start (the twin is followed by something else; with
+// only the twin's first 5 bytes it matched both in 5.0 and in 6adfbd7a, and the live build found neither)
+FUNC_OPT("CSkeletalAnimationContainer::FindAnimation", 0x0241cf20, "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 30 48 8B 3D ?? ?? ?? ?? 33 ED 48 8B DA 48 8B F1 48 85 FF 75 ?? BA 38 00 00 00 48 8D 4C 24 20 E8 ?? ?? ?? ?? 48 8B 7C 24 20 33 D2 4C 8B 44 24 28 48 8B CF E8 ?? ?? ?? ?? 48 85 FF 74 ?? 48 8B CF FF 15 ?? ?? ?? ?? 48 89 6F 08 48 89 6F 10 48 89 6F 18 48 89 6F 20 48 89 6F 28 40 88 6F 30 39 6F 08 74 ?? 33 C9 E8 ?? ?? ?? ?? 48 89 6F 08 EB ?? 48 8B FD 48 89 3D ?? ?? ?? ?? 48 8B CF FF 15 ?? ?? ?? ?? 39 6F 0C 74 ?? 44 8B 03 33 D2 41 8B C0 F7 77 08 48 8B 47 28 48 8B 14 D0 48 85 D2 74 ?? 44 39 42 10 75 ?? 44 39 02 74 ?? 48 8B 52 18 48 85 D2 75 ?? 48 8B CF FF 15 ?? ?? ?? ?? 33 C0 48 8B 5C 24 40 48 8B 6C 24 48 48 8B 74 24 50 48 83 C4 30 5F C3 48 8D 4A 08 48 85 C9 74 ?? 48 8B 09 48 85 C9 74 ?? 4C 8B 4E 58 8B 46 60 4D 8D 04 C1 4D 3B C1 74 ?? 49 8B 50 F8 49 83 E8 08 48 8B D9 48 85 D2 74 ?? 48 8B 42 08 EB ?? 48 8B C5 48 3B 43 18 74 ?? 48 8B 5B 48 48 85 DB 75 ?? EB ?? 48 8B CF FF 15 ?? ?? ?? ?? 48 8B C3 EB ?? CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC 48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 30 48 8B 3D ??")
 FIELD("CStoryScenePlayer.pauseMask", "CStoryScenePlayer::Pause", 0x3, 0x498, "0F B7 81 ?? ?? ?? ?? 66 85 C0", 3)
 FIELD("CStoryScenePlayer.planId", "CStoryScenePlayer::Pause", 0x39, 0x1e4, "44 8B 89 ?? ?? ?? ?? 41 83 F9 FF", 3)
 FIELD("CStoryScenePlayer.plansCount", "CStoryScenePlayer::Pause", 0x46, 0x5e0, "44 8B 81 ?? ?? ?? ?? 33 C0", 3)

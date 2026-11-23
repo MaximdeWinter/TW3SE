@@ -901,6 +901,12 @@ void QueueWorldEditNatives() {
 
 void InstallWorldEdit() {
     QueueWorldEditNatives();
+    // 20.11.: `worldedit = off` - no attach hook and no registry of the world's objects (the crash after an upscaler
+    // change: the registry counts references on the game's handle blocks with its own increments; a test without it)
+    if (!ConfigBool("worldedit", true)) {
+        Log("worldedit: off (config) - no attach hook, no registry");
+        return;
+    }
     HookNamed("CEntity::AttachToWorld", reinterpret_cast<void*>(&AttachHook), reinterpret_cast<void**>(&oAttach));
     if (!oAttach) {
         Log("worldedit: attach hook unavailable - world edits off");

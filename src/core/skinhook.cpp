@@ -24,6 +24,7 @@
 #include <d3d12.h>
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -49,13 +50,17 @@ namespace {
 
 constexpr uint64_t kMainRootSignature = 0xe6a20b1c84a3896bull;  // the game's main one (5.01, 5.01b)
 constexpr uint64_t kRtRootSignature = 0x1950dac2999359a8ull;    // the ray tracing skinning's (5.01b)
-constexpr int kSlots = 8;
-constexpr int kCaps = 32;             // capsules per slot (tools/skin_patch.py CAPS)
+// (a plugin skinning 20-30 figures with DQS at once): 256 slots; the capsules in 8 blocks a slot is
+// given with its first capsules (row w bits 18-21: the block, 0 none), the overlay on slots 1..8 (kOvSlots)
+constexpr int kSlots = 256;
+constexpr int kCapBlocks = 8;
+constexpr int kOvSlots = 8;
+constexpr int kCaps = 32;             // capsules per block (tools/skin_patch.py CAPS)
 constexpr int kCapRows = 3;           // rows per capsule and time (tools/skin_patch.py CAP_ROWS)
 constexpr int kRing = 3;              // parts of the table buffer in flight
 constexpr uint64_t kRow = 16;
 constexpr uint64_t kCapRow0 = kSlots + 1;
-constexpr uint64_t kRecRow0 = kCapRow0 + (kSlots + 1) * kCaps * kCapRows * 2;  // tools/skin_patch.py TABLE_ROWS
+constexpr uint64_t kRecRow0 = kCapRow0 + (kCapBlocks + 1) * kCaps * kCapRows * 2;  // tools/skin_patch.py TABLE_ROWS
 constexpr uint32_t kRecs = 64;                                       // RT_RECS
 constexpr uint64_t kRows = kRecRow0 + kRecs;                         // RT_TABLE_ROWS
 constexpr uint64_t kPart = (kRows * kRow + 255) / 256 * 256;       // a constant buffer view's alignment
@@ -64,10 +69,21 @@ constexpr uint32_t kWeightCapacity = 1u << 20;  // floats in t14 (tools/skin_pat
 std::atomic<bool> g_on{false};
 int g_hTable = 0, g_hSlot = 0, g_hWeights = 0, g_hMushQ = 0, g_hMushO = 0, g_hOverlay = 0;
 constexpr uint32_t kOverlayMax = 512;  // texels a side, a slot
+// (a plugin's overlay at 3 mm a texel on a body whose own texture has 0.38): one bigger picture
+// in the same buffer - the shaders find a slot's texels at the row's base with its size (tools/skin_patch.py), only
+// the material plane's offset is fixed (kOverlayMax^2 * kSlots texels after the colour). A side up to 1448 keeps the
+// colour below it: such a slot has base 0 and shares the picture with every other big one (pieces of one body with one
+// UV); small slots are off while a big one is there (their places lie inside it).
+constexpr uint32_t kOverlayBig = 1448;  // floor(sqrt(kOverlayMax^2 * kOvSlots))
 ID3D12Resource* g_ov = nullptr;       // upload heap: RGBA8, kOverlayMax^2 a slot (slot s at (s - 1) * that), the
 uint32_t* g_ovMap = nullptr;          // colour planes of all slots, then their material planes
 uint32_t g_ovSize[kSlots + 1] = {};   // a slot's overlay side (0: none)
+uint32_t g_ovBase[kSlots + 1] = {};   // where its texels start in the colour plane (the row's z)
 bool g_ovMat[kSlots + 1] = {};        // a slot's material plane is set
+// (a chunk of a body mesh with a UV of its own, lying on another part's place in the body's picture): a chunk's draws can take a slot of their own, an alias - the same skinning (the parent's row:
+// capsules, DQS, block) with its own overlay. The alias slot has no mesh; its row is written with its parent's.
+int g_aliasOf[kSlots + 1] = {};       // an alias slot's parent (0: not an alias)
+int g_dqsShaders = 0;                 // the shaders skin with dual quaternions on a slot's bit (skinhook.txt: dqs 1)
 int g_ovPlanes = 1;                   // the planes the shaders read (skinhook.txt: overlay 2)  // our root parameters' handles (shaders.cpp)
 int g_hRtTable = 0, g_hRtWeights = 0;             // the same on the ray tracing skinning's signature
 int g_hRtCapture = 0;                             // u15: the capture of the skinned positions (ray tracing)
@@ -103,8 +119,19 @@ struct Slot {
     int count = 0;
     float last[kCaps][12] = {};  // what the frame before had (written with the table)
     int lastCount = 0;
+    bool dqs = false;  // dual quaternion skinning (the slot's row w, bit 17)
+    int capBlock = 0;  // its capsules' block, 1..kCapBlocks (0: none; row w bits 18-21)
+    struct Alias { uint32_t chunk, off0; int slot; };
+    std::vector<Alias> alias;  // chunks drawn with a slot of their own (off0: their stream 0 from lo, ~0u: not found)
 };
 Slot g_slots[kSlots + 1];  // [0] stays empty
+std::vector<std::pair<uint64_t, int>> g_starts;  // (lo, slot) of every slot with a mesh, by lo (SkinHookSlotOf)
+void Reindex() {                                 // under g_mx, unique
+    g_starts.clear();
+    for (int s = 1; s <= kSlots; ++s)
+        if (g_slots[s].hi) g_starts.push_back({g_slots[s].lo, s});
+    std::sort(g_starts.begin(), g_starts.end());
+}
 ID3D12Resource* g_buf = nullptr;
 uint8_t* g_map = nullptr;
 std::atomic<uint32_t> g_part{0};
@@ -147,7 +174,7 @@ void MakeBuffer(ID3D12PipelineState* pso) {
         g_map = static_cast<uint8_t*>(m);
         g_buf = b;
         void* om = nullptr;
-        g_ov = UploadBuffer(dev, 2 * 4ull * kOverlayMax * kOverlayMax * kSlots, &om);
+        g_ov = UploadBuffer(dev, 2 * 4ull * kOverlayMax * kOverlayMax * kOvSlots, &om);
         g_ovMap = static_cast<uint32_t*>(om);
         D3D12_HEAP_PROPERTIES dh = {D3D12_HEAP_TYPE_DEFAULT};
         D3D12_RESOURCE_DESC cd = {};
@@ -182,11 +209,13 @@ void WriteTable() {
     if (!g_map) return;
     uint32_t part = (g_part.load(std::memory_order_relaxed) + 1) % kRing;
     uint8_t* dst = g_map + part * kPart;
+    memset(dst + kCapRow0 * kRow, 0, (kRecRow0 - kCapRow0) * kRow);  // the capsule blocks no slot has (block 0 too)
     uint32_t n = 0;  // chunks in the ray tracing list
     {
         std::unique_lock<std::shared_mutex> l(g_mx);  // (the frame before's capsules are kept here)
         for (int s = 0; s <= kSlots; ++s) {
             Slot& sl = g_slots[s];
+            if (g_aliasOf[s]) continue;  // (written with its parent's)
             if (sl.rm && !sl.lost) {  // still the vertex data it was given with? else no draw is this slot's any more
                 uint64_t va = 0, size = 0;
                 if (!MeshVertexRange(sl.rm, &va, &size) || va != sl.lo || va + size != sl.hi) {
@@ -196,19 +225,29 @@ void WriteTable() {
                     Log("skinhook: slot %d: the mesh is gone or was loaded anew - add it again", s);
                 }
             }
-            uint32_t counts[4] = {static_cast<uint32_t>(sl.count), static_cast<uint32_t>(sl.lastCount),
-                                  s ? (s - 1) * kOverlayMax * kOverlayMax : 0u, s && sl.rm && !sl.lost ? g_ovSize[s] | (g_ovMat[s] && g_ovPlanes >= 2 ? 1u << 16 : 0u) : 0u};
+            const bool blk = sl.capBlock > 0;
+            auto ov = [](int t) { return g_ovSize[t] | (g_ovSize[t] && g_ovMat[t] && g_ovPlanes >= 2 ? 1u << 16 : 0u); };
+            const bool live = s && sl.rm && !sl.lost;
+            uint32_t counts[4] = {blk ? static_cast<uint32_t>(sl.count) : 0u, blk ? static_cast<uint32_t>(sl.lastCount) : 0u,
+                                  g_ovBase[s],
+                                  live ? ov(s) | (sl.dqs ? 1u << 17 : 0u) | (static_cast<uint32_t>(sl.capBlock) << 18) : 0u};
             memcpy(dst + s * kRow, counts, kRow);
-            for (int c = 0; c < kCaps; ++c)
-                for (int t = 0; t < 2; ++t) {
-                    const float* v = t == 0 ? sl.cap[c] : sl.last[c];
-                    uint64_t row = kCapRow0 + static_cast<uint64_t>(s) * kCaps * kCapRows * 2 + c * kCapRows * 2 +
-                                   t * kCapRows;
-                    memcpy(dst + row * kRow, v, kCapRows * kRow);
-                }
+            for (const Slot::Alias& a : sl.alias) {  // its chunks' own rows: the same but the overlay
+                uint32_t r[4] = {counts[0], counts[1], g_ovBase[a.slot], live ? (counts[3] & ~0x1ffffu) | ov(a.slot) : 0u};
+                memcpy(dst + a.slot * kRow, r, kRow);
+            }
+            if (blk)
+                for (int c = 0; c < kCaps; ++c)
+                    for (int t = 0; t < 2; ++t) {
+                        const float* v = t == 0 ? sl.cap[c] : sl.last[c];
+                        uint64_t row = kCapRow0 + static_cast<uint64_t>(sl.capBlock) * kCaps * kCapRows * 2 +
+                                       c * kCapRows * 2 + t * kCapRows;
+                        memcpy(dst + row * kRow, v, kCapRows * kRow);
+                    }
             memcpy(sl.last, sl.cap, sizeof sl.cap);
             sl.lastCount = sl.count;
-            for (size_t c = 0; s && sl.rm && !sl.lost && c * 2 + 1 < sl.rec.size() && n < kRecs; ++c) {
+            // the ray tracing list: the chunks of the slots with capsules (the ray tracing skinning only pushes)
+            for (size_t c = 0; s && blk && sl.rm && !sl.lost && c * 2 + 1 < sl.rec.size() && n < kRecs; ++c) {
                 uint32_t w = ~0u;
                 for (const Weights& x : sl.weights)
                     if (x.chunk == c && x.sent && x.off0 != ~0u && !x.w.empty()) w = x.base;
@@ -258,10 +297,11 @@ void InstallSkinHook() {
         return;
     }
     char line[128];
-    int caps = 8, rows = 2, mush = 0, planes = 1;  // a list without the layout line: shaders of the first layout
+    int caps = 8, rows = 2, mush = 0, planes = 1, dqs = 0, slots = 8;  // a list without the layout line: the first layout
     while (fgets(line, sizeof line, f)) {
         if (line[0] == '#') {
-            sscanf_s(line, "# layout capsules %d rows %d mush %d overlay %d", &caps, &rows, &mush, &planes);
+            sscanf_s(line, "# layout capsules %d rows %d mush %d overlay %d dqs %d slots %d", &caps, &rows, &mush, &planes,
+                     &dqs, &slots);
             continue;
         }
         uint64_t id = 0;
@@ -269,9 +309,11 @@ void InstallSkinHook() {
     }
     fclose(f);
     g_ovPlanes = planes;
-    if (caps != kCaps || rows != kCapRows) {
-        Log("skinhook: the shaders in tw3se\\shaders were made for %d capsules of %d rows, this TW3SE has %d of %d: "
-            "the skinning hook stays off (tools/skin_build.py makes them anew)", caps, rows, kCaps, kCapRows);
+    g_dqsShaders = dqs;
+    if (caps != kCaps || rows != kCapRows || slots != kSlots) {
+        Log("skinhook: the shaders in tw3se\\shaders were made for %d capsules of %d rows and %d slots, this TW3SE has "
+            "%d of %d and %d: the skinning hook stays off (tools/skin_build.py makes them anew)", caps, rows, slots,
+            kCaps, kCapRows, kSlots);
         g_vsIds.clear();
         return;
     }
@@ -432,13 +474,17 @@ uint32_t SkinHookSlotOf(uint64_t va, uint32_t* weights, uint32_t* mush) {
     g_lastVa.store(va, std::memory_order_relaxed);
     if (!va) return 0;
     std::shared_lock<std::shared_mutex> l(g_mx);
-    for (int s = 1; s <= kSlots; ++s) {
+    auto it = std::upper_bound(g_starts.begin(), g_starts.end(), std::make_pair(va, kSlots + 1));
+    if (it != g_starts.begin()) {
+        const int s = (--it)->second;
         const Slot& sl = g_slots[s];
-        if (!sl.hi || va < sl.lo || va >= sl.hi) continue;
+        if (!sl.hi || va < sl.lo || va >= sl.hi) return 0;
         for (const Weights& w : sl.weights)
             if (w.sent && sl.lo + w.off0 == va) *weights = w.base;
         g_slotDraws.fetch_add(1, std::memory_order_relaxed);
         *mush = MushAreaOf(s, va, sl.lo);
+        for (const Slot::Alias& a : sl.alias)  // a chunk with a slot of its own (SkinHookChunkSlot)
+            if (a.off0 != ~0u && sl.lo + a.off0 == va) return static_cast<uint32_t>(a.slot);
         return static_cast<uint32_t>(s);
     }
     return 0;
@@ -465,12 +511,20 @@ uint64_t SkinHookOverlayVa() { return g_ov ? g_ov->GetGPUVirtualAddress() : 0; }
 // material: R wet (the game's own rain look), G matte, B height (its slope tilts the normal). nullptr: the plane
 // clear. A new size clears the other plane; size 0: the overlay off. Any thread.
 bool SkinHookOverlayPlane(int slot, int plane, const void* rgba8, int size, std::string* err) {
-    if (slot < 1 || slot > kSlots || size < 0 || size > static_cast<int>(kOverlayMax))
-        return *err = "bad slot, or a size outside 0 to 512", false;
+    if (slot < 1 || slot > kOvSlots || size < 0 || size > static_cast<int>(kOverlayBig))
+        return *err = "a slot outside 1 to 8 (w3.skinhook.add(c, true)), or a size outside 0 to 1448", false;
     std::unique_lock<std::shared_mutex> l(g_mx);
     if (!g_ovMap) return *err = "the skinning hook is off", false;
-    uint32_t* p[2] = {g_ovMap + (slot - 1) * kOverlayMax * kOverlayMax,
-                      g_ovMap + (kSlots + slot - 1) * kOverlayMax * kOverlayMax};
+    const bool big = static_cast<uint32_t>(size) > kOverlayMax;
+    bool bigThere = false;
+    for (int s = 1; s <= kOvSlots; ++s) bigThere |= s != slot && g_ovSize[s] > kOverlayMax;
+    if (size && !big && bigThere) return *err = "a picture bigger than 512 is on another slot", false;
+    if (big)                                                   // the small ones' places lie inside the big picture
+        for (int s = 1; s <= kOvSlots; ++s)
+            if (g_ovSize[s] && g_ovSize[s] <= kOverlayMax) g_ovSize[s] = 0, g_ovMat[s] = false;
+    const uint32_t at = big ? 0u : (slot - 1) * kOverlayMax * kOverlayMax;
+    g_ovBase[slot] = at;
+    uint32_t* p[2] = {g_ovMap + at, g_ovMap + kOvSlots * kOverlayMax * kOverlayMax + at};
     size_t n = 4ull * size * size;
     if (size && static_cast<uint32_t>(size) != g_ovSize[slot]) {
         memset(p[plane ^ 1], 0, n);
@@ -488,9 +542,72 @@ bool SkinHookOverlay(int slot, const void* rgba8, int size, std::string* err) {
     return SkinHookOverlayPlane(slot, 0, rgba8, size, err);
 }
 
+// (a body, a chunk of it and its head each a picture): a plane of a slot's overlay at a place the
+// caller lays out - `base` texels from the buffer's start, `size` x `size` (base + size^2 within the 2 097 152 texels
+// all pictures share; the caller keeps them apart). Any slot of 1..256, an alias too. nullptr: the plane clear;
+// size 0: the overlay off.
+bool SkinHookOverlayRegion(int slot, int plane, const void* rgba8, int size, int base, std::string* err) {
+    constexpr uint64_t room = static_cast<uint64_t>(kOverlayMax) * kOverlayMax * kOvSlots;
+    if (slot < 1 || slot > kSlots || plane < 0 || plane > 1 || size < 0 || base < 0 ||
+        static_cast<uint64_t>(base) + static_cast<uint64_t>(size) * size > room)
+        return *err = "a slot outside 1 to 256, or the picture outside the buffer (base + size^2 <= 2097152)", false;
+    std::unique_lock<std::shared_mutex> l(g_mx);
+    if (!g_ovMap) return *err = "the skinning hook is off", false;
+    uint32_t* p = g_ovMap + (plane ? room : 0) + base;
+    const size_t n = 4ull * size * size;
+    if (size && rgba8) memcpy(p, rgba8, n);
+    else if (size) memset(p, 0, n);
+    if (plane == 1) g_ovMat[slot] = size && rgba8;
+    if (!size) g_ovMat[slot] = false;
+    g_ovSize[slot] = static_cast<uint32_t>(size);
+    g_ovBase[slot] = static_cast<uint32_t>(base);
+    return true;
+}
+
+// A chunk of a slot's mesh drawn with a slot of its own (an alias: the parent's skinning, its own overlay); the alias
+// slot's number, 0 with why in *err. Again for the same chunk: the same alias. chunk -1: the slot's aliases gone.
+int SkinHookChunkSlot(int slot, int chunk, std::string* err) {
+    std::unique_lock<std::shared_mutex> l(g_mx);
+    if (slot < 1 || slot > kSlots || g_aliasOf[slot] || !g_slots[slot].rm || g_slots[slot].lost)
+        return *err = "no mesh in the slot", 0;
+    Slot& sl = g_slots[slot];
+    if (chunk < 0) {
+        for (const Slot::Alias& a : sl.alias) g_aliasOf[a.slot] = 0, g_ovSize[a.slot] = 0, g_ovMat[a.slot] = false;
+        sl.alias.clear();
+        return slot;
+    }
+    uint32_t off0 = 0, count = 0, chunks = 0;
+    if (!MeshChunk(sl.rm, static_cast<uint32_t>(chunk), &off0, &count, &chunks))
+        return *err = "chunk " + std::to_string(chunk) + " is not in the mesh (" + std::to_string(chunks) + " chunks)", 0;
+    for (Slot::Alias& a : sl.alias)
+        if (a.chunk == static_cast<uint32_t>(chunk)) return a.off0 = off0, a.slot;
+    // from the top (SkinHookAdd takes 9.. first; the skin pixel shaders read the overlay of every slot since
+    // 20.11. - before, of 1..8 only)
+    for (int s = kSlots; s >= 1; --s) {
+        if (!g_slots[s].rm && !g_aliasOf[s]) {
+            g_aliasOf[s] = slot;
+            g_ovSize[s] = 0, g_ovBase[s] = 0, g_ovMat[s] = false;
+            sl.alias.push_back({static_cast<uint32_t>(chunk), off0, s});
+            return s;
+        }
+    }
+    return *err = "all 256 slots are taken", 0;
+}
+
 // Delta Mush on a slot's mesh (mush.cpp): iterations 0 = off.
 bool MushEnable(int slot, uintptr_t rm, int iterations, std::string* err);
 bool MushMask(int slot, int chunk, const float* mask, int count, std::string* err);
+// Dual quaternion skinning for the slot's mesh: the patched shaders skin it anew from the same bones and weights
+// (tools/skin_patch.py dqs_code), the joints keep their volume where the game's linear blend folds them in. From the
+// next frame on; Delta Mush and the capsules work on top of it.
+bool SkinHookDqs(int slot, bool on, std::string* err) {
+    if (!g_dqsShaders) return *err = "the shaders in tw3se\\shaders have no dual quaternion skinning (tools/skin_build.py makes them anew)", false;
+    std::unique_lock<std::shared_mutex> l(g_mx);
+    if (slot < 1 || slot > kSlots || !g_slots[slot].rm || g_slots[slot].lost) return *err = "no mesh in the slot", false;
+    g_slots[slot].dqs = on;
+    return true;
+}
+
 bool SkinHookDeltaMush(int slot, int iterations, std::string* err) {
     uintptr_t rm = 0;
     {
@@ -555,7 +672,7 @@ void SkinHookFrameStart() {
 }
 
 // A render mesh gets a slot (1..8), 0 when there is none free or its vertex data is not found.
-int SkinHookAdd(uintptr_t rm, std::string* err) {
+int SkinHookAdd(uintptr_t rm, std::string* err, bool low) {
     uint64_t va = 0, size = 0;
     if (!SkinHookOn()) {
         *err = "the skinning hook is off (skin_hook = on in tw3se.config, and tw3se\\shaders\\skinhook.txt)";
@@ -581,27 +698,44 @@ int SkinHookAdd(uintptr_t rm, std::string* err) {
                     w.off0 = ~0u;
                 }
             }
+            for (Slot::Alias& a : g_slots[s].alias) {
+                uint32_t off0 = 0, count = 0;
+                a.off0 = MeshChunk(rm, a.chunk, &off0, &count, nullptr) ? off0 : ~0u;
+            }
             ReadChunks(g_slots[s]);
+            Reindex();
             return s;
         }
-    for (int s = 1; s <= kSlots; ++s)
-        if (!g_slots[s].rm) {
+    for (int k = 0; k < kSlots; ++k) {  // low: 1..8 first; else 9..256 first, 1..8 last
+        const int s = low ? k + 1 : (k < kSlots - kOvSlots ? kOvSlots + 1 + k : k - (kSlots - kOvSlots) + 1);
+        if (!g_slots[s].rm && !g_aliasOf[s]) {
             g_slots[s] = Slot{};
             g_slots[s].rm = rm;
             g_slots[s].lo = va;
             g_slots[s].hi = va + size;
             ReadChunks(g_slots[s]);
+            Reindex();
             return s;
         }
-    *err = "all 8 slots are taken";
+    }
+    *err = "all 256 slots are taken";
     return 0;
 }
 
 bool SkinHookRemove(int slot) {
     if (slot < 1 || slot > kSlots) return false;
     std::unique_lock<std::shared_mutex> l(g_mx);
+    if (const int p = g_aliasOf[slot]) {  // an alias: its parent's chunk drawn with the parent again
+        auto& v = g_slots[p].alias;
+        v.erase(std::remove_if(v.begin(), v.end(), [&](const Slot::Alias& a) { return a.slot == slot; }), v.end());
+        g_aliasOf[slot] = 0, g_ovSize[slot] = 0, g_ovMat[slot] = false;
+        return true;
+    }
     bool had = g_slots[slot].rm != 0;
+    for (const Slot::Alias& a : g_slots[slot].alias) g_aliasOf[a.slot] = 0, g_ovSize[a.slot] = 0, g_ovMat[a.slot] = false;
     g_slots[slot] = Slot{};
+    g_ovSize[slot] = 0, g_ovMat[slot] = false;
+    Reindex();
     bool weights = false;  // t14 starts over once no slot has weights (no draw reads them then)
     for (int s = 1; s <= kSlots; ++s) weights = weights || !g_slots[s].weights.empty();
     if (!weights) g_wNext = 1;
@@ -666,11 +800,30 @@ bool SkinHookWeights(int slot, int chunk, const float* weights, int count, std::
 
 // The capsules of a slot from now on: `n` of them, 8 floats each (a.xyz, radius, b.xyz, strength), in the model space
 // of the slot's mesh; more than 8 are left out. False for a slot without a mesh.
+// A slot's capsule block (under g_mx): one with its first capsules, given back with none. False: all 8 taken.
+bool CapBlock(Slot& sl, int n) {
+    if (!n) {
+        sl.capBlock = 0;
+        return true;
+    }
+    if (sl.capBlock) return true;
+    bool used[kCapBlocks + 1] = {};
+    for (int s = 1; s <= kSlots; ++s) used[g_slots[s].capBlock] = true;
+    for (int b = 1; b <= kCapBlocks; ++b)
+        if (!used[b]) {
+            sl.capBlock = b;
+            return true;
+        }
+    static bool told = false;
+    if (!told) Log("skinhook: all %d capsule blocks are taken - a slot's capsules left out", kCapBlocks), told = true;
+    return false;
+}
+
 bool SkinHookCapsules(int slot, const float* caps, int n) {
     if (slot < 1 || slot > kSlots || n < 0 || (n && !caps)) return false;
     std::unique_lock<std::shared_mutex> l(g_mx);
     Slot& sl = g_slots[slot];
-    if (!sl.rm) return false;
+    if (!sl.rm || !CapBlock(sl, n)) return false;
     sl.count = n < kCaps ? n : kCaps;
     memset(sl.cap, 0, sizeof sl.cap);
     for (int c = 0; c < sl.count; ++c) memcpy(sl.cap[c], caps + 8 * c, sizeof(float) * 8);  // falloff 0, out
@@ -682,7 +835,7 @@ bool SkinHookCapsulesEx(int slot, const float* caps, int n) {
     if (slot < 1 || slot > kSlots || n < 0 || (n && !caps)) return false;
     std::unique_lock<std::shared_mutex> l(g_mx);
     Slot& sl = g_slots[slot];
-    if (!sl.rm) return false;
+    if (!sl.rm || !CapBlock(sl, n)) return false;
     sl.count = n < kCaps ? n : kCaps;
     memset(sl.cap, 0, sizeof sl.cap);
     for (int c = 0; c < sl.count; ++c) {

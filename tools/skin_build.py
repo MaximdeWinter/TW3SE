@@ -96,7 +96,7 @@ def main(dump, out, inject):
     with open(listing, "w", encoding="utf-8", newline="\n") as f:
         f.write("# skinning vertex shaders with TW3SE's hook (tools/skin_build.py, inject " + inject + ")\n")
         if inject == "capsules":  # TW3SE reads it: the table's layout has to be its own
-            f.write("# layout capsules %d rows %d mush 1 overlay 2\n" % (skin_patch.CAPS, skin_patch.CAP_ROWS))
+            f.write("# layout capsules %d rows %d mush 1 overlay 2 dqs 1\n" % (skin_patch.CAPS, skin_patch.CAP_ROWS))
         for sid in ids:
             f.write(sid + "\n")
     print(f"patched {len(made)}, no position found {len(skipped)}, failed {len(failed)}")

@@ -509,6 +509,180 @@ function w3.material.apply(entity)  -- the entity's meshes drawn anew with the m
   return n
 end
 
+-- Materials of the entity's own: each mesh component gets a mesh of its own (w3.deform.own: the mesh file loaded a
+-- second time), and the material instances inside it come with it, so w3.material.set changes this entity only.
+-- Returns how many meshes became its own.
+function w3.material.own(entity)
+  local n = 0
+  for _, c in ipairs(entity:GetComponentsByClassName("CMeshComponent") or {}) do
+    if c.mesh and pcall(w3.deform.own, c) then n = n + 1 end
+  end
+  return n
+end
+
+-- A figure's look in parts: the mesh components of the figure and of its mounted items (head, hair, armour, ...).
+-- A skinned part takes another mesh of the same skeleton (the skinning maps its bones anew by name: the gloves'
+-- component with the pants' mesh drew the pants at the legs, measured), and parts go on and off.
+w3.figure = w3.figure or {}
+function w3.figure.parts(actor)  -- {component, name, mesh (path), item (name or nil), visible}
+  local out = {}
+  local function add(e, item)
+    for _, c in ipairs(e:GetComponentsByClassName("CMeshComponent") or {}) do
+      out[#out + 1] = {component = c, name = c:GetName(), mesh = c.mesh and c.mesh:GetPath() or nil, item = item,
+                       visible = c:IsVisible()}
+    end
+  end
+  add(actor)
+  local inv = actor.GetInventory and actor:GetInventory()
+  if inv then
+    for _, id in ipairs(inv:GetAllItems({}) or {}) do
+      if inv:IsItemMounted(id) then
+        local e = inv:GetItemEntityUnsafe(id)
+        if e then add(e, inv:GetItemName(id)) end
+      end
+    end
+  end
+  return out
+end
+function w3.figure.part(actor, name)  -- the part whose component is called `name` (or whose mesh path holds it)
+  for _, p in ipairs(w3.figure.parts(actor)) do
+    if p.name == name or (p.mesh and p.mesh:find(name, 1, true)) then return p end
+  end
+end
+-- what Lua changed on a figure's look, for w3.figure.look: component address -> {visible, mesh}; shapes by address
+local changed, shaped = {}, {}
+w3._shaped = shaped
+function w3.figure.show(part, on)
+  local c = part.component or part
+  c:SetVisible(on ~= false)
+  local k = w3.addr(c)
+  changed[k] = changed[k] or {}
+  changed[k].visible = on ~= false
+end
+function w3.figure.mesh(part, mesh)  -- a mesh (CMesh or its path) into the part
+  if type(mesh) == "string" then mesh = w3.load(mesh) or error("w3.figure.mesh: no mesh " .. mesh, 2) end
+  local c = part.component or part
+  local r = w3.set_mesh(c, mesh)
+  local k = w3.addr(c)
+  changed[k] = changed[k] or {}
+  changed[k].mesh = mesh:GetPath()
+  return r
+end
+-- A new part (measured): an entity of its own, each of its mesh components skinned to the figure's skeleton the way
+-- the game skins an item: a CMeshSkinningAttachment made with w3.new, its Init (vf43: parent, child, spawn info or
+-- null) from the figure's root animated component to the mesh component; Break is vf44. Made from a mesh alone the
+-- part has no coloring entries (a mesh with a colour mask draws red); a template (an item's .w2ent) brings them.
+-- The entity hangs on the figure, so it goes along; it is not saved.
+local added = {}  -- handle -> {entity, attachments}
+function w3.figure.add(actor, what)  -- what: a mesh path, a template path or a CEntityTemplate; -> handle, parts
+  local ac = actor:GetRootAnimatedComponent() or error("w3.figure.add: the figure has no animated component", 2)
+  local t = what
+  if type(what) == "string" and what:lower():match("%.w2mesh$") then
+    t = w3._mesh_template(what, "CEntity", "CMeshComponent")
+  elseif type(what) == "string" then
+    t = w3.load(what) or error("w3.figure.add: no template " .. what, 2)
+  end
+  local e = w3.global("theGame"):CreateEntity(t, actor:GetWorldPosition(), actor:GetWorldRotation(), true, false,
+                                              false, "PM_DontPersist", {})
+  if not e then error("w3.figure.add: the game made no entity", 2) end
+  e:CreateAttachment(actor)
+  local h = {entity = e, attachments = {}, template = t, actor = w3.addr(actor),
+             what = type(what) == "string" and what or nil}
+  local parts = {}
+  for _, c in ipairs(e:GetComponentsByClassName("CMeshComponent") or {}) do
+    local att = w3.new("CMeshSkinningAttachment", ac)
+    if w3.engine_call("CMeshSkinningAttachment::vf43", "pppp>b", att, ac, c, nil) then
+      h.attachments[#h.attachments + 1] = att
+    else
+      w3.discard(att)
+    end
+    parts[#parts + 1] = {component = c, name = c:GetName(), mesh = c.mesh and c.mesh:GetPath() or nil,
+                         visible = c:IsVisible()}
+  end
+  added[h] = true
+  return h, parts
+end
+function w3.figure.remove(h)  -- a part made with w3.figure.add goes again
+  if not added[h] then return false end
+  for _, att in ipairs(h.attachments) do
+    pcall(w3.engine_call, "CMeshSkinningAttachment::vf44", "p>v", att)
+  end
+  if h.entity then pcall(function() h.entity:Destroy() end) end
+  added[h] = nil
+  return true
+end
+-- A figure's look as Lua made it, as a plain table for w3.store: the shapes of body and face, the parts turned off or
+-- given another mesh (by component name) and the parts added by path. w3.figure.apply puts it on a figure again.
+local function face_of(actor)
+  for _, p in ipairs(w3.figure.parts(actor)) do
+    local e = p.component:GetEntity()
+    local m = e and (e:GetComponentsByClassName("CMimicComponent") or {})[1]
+    if m then return m end
+  end
+end
+function w3.figure.look(actor)
+  local look = {parts = {}, added = {}}
+  local body, face = actor:GetRootAnimatedComponent(), face_of(actor)
+  look.body = body and shaped[w3.addr(body)] or nil
+  look.face = face and shaped[w3.addr(face)] or nil
+  for _, p in ipairs(w3.figure.parts(actor)) do
+    local c = changed[w3.addr(p.component)]
+    if c then look.parts[p.name] = {visible = c.visible, mesh = c.mesh} end
+  end
+  local me = w3.addr(actor)
+  for h in pairs(added) do
+    if h.actor == me and h.what then look.added[#look.added + 1] = h.what end
+  end
+  table.sort(look.added)
+  return look
+end
+function w3.figure.apply(actor, look)  -- -> the handles of the added parts
+  if look.body then w3.anim.shape(actor, look.body) end
+  local face = look.face and face_of(actor)
+  if face then w3.anim.shape(face, look.face) end
+  for _, p in ipairs(w3.figure.parts(actor)) do
+    local c = look.parts and look.parts[p.name]
+    if c then
+      if c.mesh then w3.figure.mesh(p, c.mesh) end
+      if c.visible ~= nil then w3.figure.show(p, c.visible) end
+    end
+  end
+  local hs = {}
+  for _, what in ipairs(look.added or {}) do hs[#hs + 1] = w3.figure.add(actor, what) end
+  return hs
+end
+)TW3SELIB" R"TW3SELIB(
+-- A preview of a figure (a character editor's view): the free camera on it from the front, turned around it by yaw
+-- (degrees), and a light of its own beside the camera. Called again it moves the view; preview_end gives the game's
+-- camera back and takes the light away.
+local preview
+function w3.figure.preview(actor, o)
+  o = o or {}
+  local p = actor:GetWorldPosition()
+  local h = actor:GetHeading() + (o.yaw or 0)
+  local dist, at, lift = o.distance or 2.5, o.height or 1.2, o.lift or 0
+  local r = math.rad(h)
+  local fx, fy = -math.sin(r), math.cos(r)
+  w3.camera.free(true)
+  w3.camera.move({X = p.X + fx * dist, Y = p.Y + fy * dist, Z = p.Z + at + lift, W = 1},
+                 {Pitch = -math.deg(math.atan(lift, dist)), Yaw = h + 180, Roll = 0})
+  if o.fov then w3.camera.fov(o.fov) end
+  if preview and preview.lamp then pcall(function() preview.lamp:Destroy() end) end
+  preview = {}
+  if o.light ~= false then
+    local side = math.rad(h + 35)
+    preview.lamp = w3.light.spawn({X = p.X - math.sin(side) * 1.5, Y = p.Y + math.cos(side) * 1.5, Z = p.Z + at + 0.8, W = 1},
+                                  {color = o.color or {255, 240, 225}, radius = 6, brightness = o.brightness or 40})
+  end
+end
+function w3.figure.preview_end()
+  if preview and preview.lamp then pcall(function() preview.lamp:Destroy() end) end
+  preview = nil
+  w3.camera.fov(false)
+  w3.camera.free(false)
+end
+
+)TW3SELIB" R"TW3SELIB(
 -- the render proxy of a drawable component made anew from its current data; false when it is not in the world
 w3.refresh = w3._refresh
 
@@ -698,7 +872,7 @@ w3.deform.live_bounds = w3._lm_bounds  -- (id, {min x, y, z}, {max x, y, z}): th
 -- The skinning shader hook (skin_hook = on): a mesh gets a slot, the patched skinning shaders push the skinned
 -- vertices of its draws out of capsules (up to 8 a slot, in the mesh's model space, metres).
 w3.skinhook = {}
-function w3.skinhook.add(c) return w3._skin_add(render_mesh(c)) end  -- slot 1..8 | nil, error
+function w3.skinhook.add(c, low) return w3._skin_add(render_mesh(c), low) end  -- slot 1..256 (low: 1..8, the overlay's) | nil, error
 w3.skinhook.remove = w3._skin_remove
 -- (slot, {{a = {x, y, z}, b = {x, y, z}, radius = r, strength = s, falloff = k, inward = true}, ...}), up to 32:
 -- strength 1 pushes to the surface; falloff (metres) makes the push soft, from k beyond the surface on; inward draws
@@ -728,6 +902,7 @@ function w3.skinhook.overlay(slot, size, colour, material)
   return ok, err
 end
 w3.skinhook.mush = w3._skin_mush            -- (slot, iterations): Delta Mush on the slot's mesh (0 = off)
+w3.skinhook.dqs = w3._skin_dqs              -- (slot, on): dual quaternion skinning for the slot's mesh
 w3.skinhook.mush_mask = w3._skin_mush_mask  -- (slot, chunk, {m, ...}): how much of it each vertex takes (0..1)
 w3.skinhook.state = w3._skin_state      -- (slot) -> "none", "active", "lost"
 -- (slot, chunk, {w, ...}): one weight a vertex of the chunk (0 no push .. 1 all); {} takes them away
@@ -841,6 +1016,269 @@ local function px_scene()
   return w3._px_scene(w3.addr(world)) or error("no PhysX scene in the world", 3)
 end
 w3.physics.scene = px_scene
+)TW3SELIB" R"TW3SELIB(
+-- Own PhysX bodies in the world's scene. PhysX 3.3 is linked into witcher3.exe without RTTI: the slots are those of
+-- the PhysX 3.3 headers, read in the vtables of NpScene, NpPhysics and NpRigidDynamic (6adfbd7a) and each checked
+-- live (the actor's type name at slot 1, getType 1 for a dynamic one, the mass, the counts). PxFlags arguments go by
+-- pointer (MSVC passes a class with a copy constructor by reference).
+do
+  -- (this build's PxRigidBody lacks two methods of the 3.3 headers before setKinematicTarget: from there on the slots
+  -- are 2 lower, measured by the kinematic target's code, which slot 53 calls)
+  local SCENE = {getPhysics = 6, addActor = 10, removeActor = 12, getNbActors = 17, getActors = 18}
+  local PHYS = {createRigidStatic = 25, createRigidDynamic = 26, createShape = 30, createMaterial = 35}
+  local ACTOR = {release = 0, getConcreteTypeName = 1, getGlobalPose = 20, setGlobalPose = 21, attachShape = 23,
+                 getShapes = 26, setMass = 31, getMass = 32, setMassSpaceInertiaTensor = 34, getLinearVelocity = 37,
+                 setLinearVelocity = 38, addForce = 41, setRigidBodyFlag = 47, setKinematicTarget = 53, wakeUp = 68}
+  local SHAPE = {setSimulationFilterData = 18, getSimulationFilterData = 19, setQueryFilterData = 21,
+                 getQueryFilterData = 22}
+  local function vcall(obj, slot, sig, ...) return w3.engine_call(w3.peek(w3.peek(obj) + 8 * slot), sig, obj, ...) end
+  local function xyz(v, d)
+    if v == nil then return d, d, d end
+    if type(v) == "number" then return v, v, v end
+    return v.X or v.x or v[1] or 0, v.Y or v.y or v[2] or 0, v.Z or v.z or v[3] or 0
+  end
+  local function transform(pos, rot)
+    local px, py, pz = xyz(pos, 0)
+    rot = rot or {0, 0, 0, 1}
+    return string.pack("<fffffff", rot.X or rot[1] or 0, rot.Y or rot[2] or 0, rot.Z or rot[3] or 0, rot.W or rot[4] or 1, px, py, pz)
+  end
+  local function physics() return vcall(px_scene(), SCENE.getPhysics, "p>p") end
+  local bodies = {}  -- handle -> true, so w3.physics.clear can take them all out
+  -- The collision filter of the game's loose objects: the most common simulation and query filter data among the
+  -- first shapes of the scene's dynamic bodies (without it a body falls through the world).
+  local filters
+  local function game_filters()
+    if filters then return filters end
+    local scene = px_scene()
+    local flags = string.pack("<I2", 2)  -- eRIGID_DYNAMIC
+    local n = vcall(scene, SCENE.getNbActors, "ps>i", flags)
+    local buf, sbuf, out = w3.mem.alloc(8 * math.max(n, 1)), w3.mem.alloc(8), w3.mem.alloc(32)
+    local got = vcall(scene, SCENE.getActors, "pspii>i", flags, buf, n, 0)
+    local count, best = {}, nil
+    for i = 0, got - 1 do
+      local a = w3.peek(buf + 8 * i)
+      if vcall(a, ACTOR.getShapes, "ppii>i", sbuf, 1, 0) == 1 then
+        local sh = w3.peek(sbuf)
+        vcall(sh, SHAPE.getSimulationFilterData, "pp>p", out)
+        local sim = w3.mem.read(out, 16)
+        vcall(sh, SHAPE.getQueryFilterData, "pp>p", out)
+        local key = sim .. w3.mem.read(out, 16)
+        count[key] = (count[key] or 0) + 1
+        if not best or count[key] > count[best] then best = key end
+      end
+    end
+    w3.mem.free(buf) w3.mem.free(sbuf) w3.mem.free(out)
+    filters = best and {sim = best:sub(1, 16), query = best:sub(17, 32)} or false
+    return filters
+  end
+
+  -- w3.physics.body{shape = "box"|"sphere"|"capsule", size = {x, y, z} (box: full size) or radius, height (capsule:
+  -- along X), pos = Vector, rot = {x, y, z, w}, mass = 10, kinematic = false, static = false, friction = 0.5,
+  -- bounce = 0.1} -> a body handle
+  function w3.physics.body(o)
+    local scene, phys = px_scene(), physics()
+    local friction = o.friction or 0.5
+    local mat = vcall(phys, PHYS.createMaterial, "pfff>p", friction, friction, o.bounce or 0.1)
+    local shape, geom, m = o.shape or "box", nil, o.mass or 10
+    local inertia
+    if shape == "sphere" then
+      local r = o.radius or (type(o.size) == "number" and o.size) or 0.25
+      geom = string.pack("<If", 0, r)
+      inertia = {0.4 * m * r * r, 0.4 * m * r * r, 0.4 * m * r * r}
+    elseif shape == "capsule" then
+      local r, h = o.radius or 0.1, o.height or 0.5
+      geom = string.pack("<Iff", 2, r, h / 2)
+      local ix = 0.5 * m * r * r
+      local iyz = m * (3 * r * r + h * h) / 12
+      inertia = {ix, iyz, iyz}
+    else
+      local x, y, z = xyz(o.size, 0.5)
+      geom = string.pack("<Ifff", 3, x / 2, y / 2, z / 2)
+      inertia = {m * (y * y + z * z) / 12, m * (x * x + z * z) / 12, m * (x * x + y * y) / 12}
+    end
+    local body = vcall(phys, o.static and PHYS.createRigidStatic or PHYS.createRigidDynamic, "ps>p", transform(o.pos, o.rot))
+    if body == 0 then error("w3.physics.body: PhysX made no body", 2) end
+    local sh = vcall(phys, PHYS.createShape, "pssibs>p", geom, string.pack("<I8", mat), 1, true, string.pack("<B", 0x0b))
+    local f = game_filters()
+    if f then
+      vcall(sh, SHAPE.setSimulationFilterData, "ps>v", f.sim)
+      vcall(sh, SHAPE.setQueryFilterData, "ps>v", f.query)
+    end
+    vcall(body, ACTOR.attachShape, "pp>v", sh)
+    vcall(sh, ACTOR.release, "p>v")  -- the body keeps the shape
+    if not o.static then
+      vcall(body, ACTOR.setMass, "pf>v", m)
+      vcall(body, ACTOR.setMassSpaceInertiaTensor, "ps>v", string.pack("<fff", inertia[1], inertia[2], inertia[3]))
+      if o.kinematic then vcall(body, ACTOR.setRigidBodyFlag, "pib>v", 1, true) end
+    end
+    vcall(scene, SCENE.addActor, "pp>v", body)
+    local h = {ptr = body, kinematic = o.kinematic and true or false, static = o.static and true or false}
+    bodies[h] = true
+    return h
+  end
+  -- {pos = Vector, rot = {x, y, z, w}}
+  function w3.physics.pose(h)
+    local buf = w3.mem.alloc(32)
+    vcall(h.ptr, ACTOR.getGlobalPose, "pp>p", buf)
+    local qx, qy, qz, qw, x, y, z = string.unpack("<fffffff", w3.mem.read(buf, 28))
+    w3.mem.free(buf)
+    return {pos = {X = x, Y = y, Z = z, W = 1}, rot = {qx, qy, qz, qw}}
+  end
+  -- a kinematic body goes there over the next step (pushing what is in the way), another one is put there
+  function w3.physics.move(h, pos, rot)
+    if h.kinematic then vcall(h.ptr, ACTOR.setKinematicTarget, "ps>v", transform(pos, rot))
+    else vcall(h.ptr, ACTOR.setGlobalPose, "psb>v", transform(pos, rot), true) end
+  end
+  -- mode: "force" (N, over the step), "impulse" (N s), "velocity" (m/s change), "acceleration" (m/s^2)
+  local MODES = {force = 0, impulse = 1, velocity = 2, acceleration = 3}
+  function w3.physics.push(h, v, mode)
+    vcall(h.ptr, ACTOR.addForce, "psib>v", string.pack("<fff", xyz(v, 0)), MODES[mode or "impulse"] or 1, true)
+  end
+  function w3.physics.speed(h, v)
+    if v then vcall(h.ptr, ACTOR.setLinearVelocity, "psb>v", string.pack("<fff", xyz(v, 0)), true) end
+    local buf = w3.mem.alloc(16)
+    vcall(h.ptr, ACTOR.getLinearVelocity, "pp>p", buf)
+    local x, y, z = string.unpack("<fff", w3.mem.read(buf, 12))
+    w3.mem.free(buf)
+    return {X = x, Y = y, Z = z, W = 0}
+  end
+  function w3.physics.body_mass(h) return vcall(h.ptr, ACTOR.getMass, "p>f") end
+  function w3.physics.remove(h)
+    if not bodies[h] then return end
+    bodies[h] = nil
+    vcall(px_scene(), SCENE.removeActor, "ppb>v", h.ptr, true)
+    vcall(h.ptr, ACTOR.release, "p>v")
+  end
+  function w3.physics.clear()
+    for j in pairs(w3.physics._joints or {}) do pcall(w3.physics.unjoint, j) end
+    for h in pairs(bodies) do pcall(w3.physics.remove, h) end
+  end
+  -- A figure's own bodies (measured on a wolf and a woman): one PxRigidDynamic per ragdoll bone, kinematic, moved
+  -- with the animation, also after death. Their userData (+0x10) is the figure's CPhysicsChainedRagdollWrapper,
+  -- whose +0x10 is the handle block of the root animated component. The component names them by index
+  -- (GetRagdollBoneName); a body is the bone whose world position is nearest.
+  function w3.physics.parts(actor)  -- {bone name -> body handle} (kinematic; for poses and joints)
+    local ac = actor:GetRootAnimatedComponent()
+    if not ac then return {} end
+    local hb = w3.peek(w3.addr(ac) + 8)
+    local scene = px_scene()
+    local flags = string.pack("<I2", 2)
+    local n = vcall(scene, SCENE.getNbActors, "ps>i", flags)
+    local buf = w3.mem.alloc(8 * math.max(n, 1))
+    local got = vcall(scene, SCENE.getActors, "pspii>i", flags, buf, n, 0)
+    local mine = {}
+    for i = 0, got - 1 do
+      local a = w3.peek(buf + 8 * i)
+      local ud = w3.peek(a + 0x10) or 0
+      if ud ~= 0 and w3.peek(ud + 0x10) == hb and (w3._typename(ud) or ""):find("RagdollWrapper", 1, true) then
+        mine[#mine + 1] = a
+      end
+    end
+    w3.mem.free(buf)
+    local bones = {}
+    for i = 0, #mine - 1 do
+      local name = tostring(ac:GetRagdollBoneName(i))
+      local bi = actor:GetBoneIndex(name)
+      if bi and bi >= 0 then
+        local m = actor:GetBoneWorldMatrixByIndex(bi)
+        bones[#bones + 1] = {name = name, X = m.W.X, Y = m.W.Y, Z = m.W.Z}
+      end
+    end
+    local out = {}
+    for _, a in ipairs(mine) do
+      local p = w3.physics.pose({ptr = a}).pos
+      local best, bd
+      for k, b in ipairs(bones) do
+        local d = (b.X - p.X) ^ 2 + (b.Y - p.Y) ^ 2 + (b.Z - p.Z) ^ 2
+        if not bd or d < bd then best, bd = k, d end
+      end
+      local h = {ptr = a, kinematic = true, game = true}
+      if best then
+        out[bones[best].name] = h
+        table.remove(bones, best)
+      else
+        out[#out + 1] = h
+      end
+    end
+    return out
+  end
+
+)TW3SELIB" R"TW3SELIB(
+  -- Joints (PhysX extensions, linked in): each kind's create function is the one that allocates with its source
+  -- file's name (PxXJointCreate(physics, actor0, frame0, actor1, frame1); the game's own code calls them). Slots of the
+  -- joints read in a live distance joint's vtable (6adfbd7a): three slots of another base come before PxBase (release
+  -- 3); this build lacks getRelativeTransform and the relative velocities of the 3.3 headers; setBreakForce 15, the
+  -- distance joint's setters at 30 (min), 32 (max), 36 (stiffness), 38 (damping), setDistanceJointFlag 41 (a setter
+  -- writes its float into the joint data at [joint+0x68]+0x48.., checked by reading it back).
+  local EXT = "E:\\Main.Lava\\dev\\external\\PhysX3\\Source\\PhysXExtensions\\src\\Ext"
+  local CREATE = {ball = EXT .. "SphericalJoint.cpp", hinge = EXT .. "RevoluteJoint.cpp", fixed = EXT .. "FixedJoint.cpp",
+                  rope = EXT .. "DistanceJoint.cpp", slider = EXT .. "PrismaticJoint.cpp"}
+  local JOINT = {release = 3, setBreakForce = 15, setMinDistance = 30, setMaxDistance = 32, setStiffness = 36,
+                 setDamping = 38, setDistanceJointFlag = 41}
+  local joints = {}
+  w3.physics._joints = joints
+  local function actor_of(b) if b == nil then return 0 end return type(b) == "table" and b.ptr or b end
+  local function pose_of(b)
+    if b == nil then return {0, 0, 0}, {0, 0, 0, 1} end
+    local buf = w3.mem.alloc(32)
+    vcall(actor_of(b), ACTOR.getGlobalPose, "pp>p", buf)
+    local qx, qy, qz, qw, x, y, z = string.unpack("<fffffff", w3.mem.read(buf, 28))
+    w3.mem.free(buf)
+    return {x, y, z}, {qx, qy, qz, qw}
+  end
+  local function rotate(q, v)  -- v by the quaternion q
+    local qx, qy, qz, qw = q[1], q[2], q[3], q[4]
+    local tx, ty, tz = 2 * (qy * v[3] - qz * v[2]), 2 * (qz * v[1] - qx * v[3]), 2 * (qx * v[2] - qy * v[1])
+    return {v[1] + qw * tx + (qy * tz - qz * ty), v[2] + qw * ty + (qz * tx - qx * tz), v[3] + qw * tz + (qx * ty - qy * tx)}
+  end
+  local function local_frame(b, at)  -- the world point `at` in b's own space, as a PxTransform
+    local p, q = pose_of(b)
+    local l = rotate({-q[1], -q[2], -q[3], q[4]}, {at[1] - p[1], at[2] - p[2], at[3] - p[3]})
+    return string.pack("<fffffff", 0, 0, 0, 1, l[1], l[2], l[3])
+  end
+  -- w3.physics.joint(kind, a, b, opts): kind "ball", "hinge", "fixed", "rope", "slider"; a and b bodies of w3.physics,
+  -- PhysX actor addresses or nil (the world). opts.at: the joint's place in the world (default: b's place, or a's).
+  -- rope: opts.length (default: the distance now), opts.stiffness and opts.damping make it a spring. opts.break_force:
+  -- it breaks above that force.
+  function w3.physics.joint(kind, a, b, opts)
+    opts = opts or {}
+    local file = CREATE[kind] or error("w3.physics.joint: the kind " .. tostring(kind) .. " (ball, hinge, fixed, rope, slider)", 2)
+    local pa, pb = pose_of(a), pose_of(b)
+    local at = opts.at and {xyz(opts.at, 0)} or (b ~= nil and pb or pa)
+    -- a rope runs between its two ends (each body's middle, or opts.at_a / opts.at_b); the others meet in one point
+    local at_a = opts.at_a and {xyz(opts.at_a, 0)} or (kind == "rope" and pa or at)
+    local at_b = opts.at_b and {xyz(opts.at_b, 0)} or (kind == "rope" and pb or at)
+    CREATE[file] = CREATE[file] or w3.engine_addr("text:" .. file) or error("w3.physics.joint: no " .. kind .. " joint in this build", 2)
+    local j = w3.engine_call(CREATE[file], "ppsps>p", physics(), actor_of(a), local_frame(a, at_a), actor_of(b), local_frame(b, at_b))
+    if j == 0 then error("w3.physics.joint: PhysX made no joint", 2) end
+    local h = {ptr = j, kind = kind}
+    if kind == "rope" then
+      local len = opts.length
+      if not len then
+        local d = {pb[1] - pa[1], pb[2] - pa[2], pb[3] - pa[3]}
+        len = math.sqrt(d[1] * d[1] + d[2] * d[2] + d[3] * d[3])
+      end
+      vcall(j, JOINT.setMaxDistance, "pf>v", len)
+      vcall(j, JOINT.setDistanceJointFlag, "pib>v", 2, true)  -- eMAX_DISTANCE_ENABLED
+      if opts.stiffness then
+        vcall(j, JOINT.setStiffness, "pf>v", opts.stiffness)
+        vcall(j, JOINT.setDamping, "pf>v", opts.damping or 0)
+        vcall(j, JOINT.setDistanceJointFlag, "pib>v", 8, true)  -- eSPRING_ENABLED
+      end
+    end
+    if opts.break_force then vcall(j, JOINT.setBreakForce, "pff>v", opts.break_force, opts.break_force) end
+    joints[h] = true
+    return h
+  end
+  function w3.physics.unjoint(h)
+    if not joints[h] then return end
+    joints[h] = nil
+    vcall(h.ptr, JOINT.release, "p>v")
+  end
+end
+-- memory for w3.engine_call (out values, structs): alloc(n) -> address, read(address, n) -> string,
+-- write(address, string), free(address)
+w3.mem = {alloc = w3._mem_alloc, read = w3._mem_read, write = w3._mem_write, free = w3._mem_free}
 function w3.physics.gravity(v)
   local x, y, z
   if v then x, y, z = w3._px_gravity(px_scene(), v.X or v[1] or 0, v.Y or v[2] or 0, v.Z or v[3] or 0)
@@ -984,7 +1422,7 @@ function w3.anim.with_sets(template, sets)
 end
 
 -- Figures ----------------------------------------------------------------------------------------------------
-w3.figure = {}
+w3.figure = w3.figure or {}
 function w3.figure.appearance(entity, name)  -- the appearance's name; with name: changes it
   if name then
     if entity.SetAppearance then entity:SetAppearance(name) else entity:ApplyAppearance(tostring(name)) end
@@ -1713,8 +2151,9 @@ local function name_hash(n)  -- a CR2W name's hash: FNV-1a 32 over its bytes and
   for i = 1, #n + 1 do h = ((h ~ (n:byte(i) or 0)) * 0x01000193) & 0xFFFFFFFF end
   return h
 end
-local function mesh_entity_data(mesh, scale)
-  local names = {"", "CGameplayEntity", "isEnabled", "Bool", "CStaticMeshComponent", "name", "String", "mesh",
+local function mesh_entity_data(mesh, scale, ecls, ccls)
+  ecls, ccls = ecls or "CGameplayEntity", ccls or "CStaticMeshComponent"
+  local names = {"", ecls, "isEnabled", "Bool", ccls, "name", "String", "mesh",
                  "handle:CMesh", "CMesh", "transform", "EngineTransform"}
   local ni = {}
   for i, n in ipairs(names) do ni[n] = i - 1 end
@@ -1748,8 +2187,8 @@ local function mesh_entity_data(mesh, scale)
   local p_off = pos; pos = pos + #ptab
   local e_off = pos; pos = pos + 48
   local d_off = pos
-  local etab = string.pack("<I2I2I4I4I4I4I4", ni["CGameplayEntity"], 0, 0, #entity, d_off, 0, crc32(entity)) ..
-               string.pack("<I2I2I4I4I4I4I4", ni["CStaticMeshComponent"], 0, 1, #comp, d_off + #entity, 0, crc32(comp))
+  local etab = string.pack("<I2I2I4I4I4I4I4", ni[ecls], 0, 0, #entity, d_off, 0, crc32(entity)) ..
+               string.pack("<I2I2I4I4I4I4I4", ni[ccls], 0, 1, #comp, d_off + #entity, 0, crc32(comp))
   local size = d_off + #entity + #comp
   local tables = string.pack("<I4I4I4", s_off, #stab, crc32(stab)) .. string.pack("<I4I4I4", n_off, #names, crc32(ntab)) ..
                  string.pack("<I4I4I4", i_off, 1, crc32(itab)) .. string.pack("<I4I4I4", p_off, 1, crc32(ptab)) ..
@@ -1757,6 +2196,11 @@ local function mesh_entity_data(mesh, scale)
   local head = string.pack("<c4I4I4I8I4I4I4I4I4", "CR2W", 164, 0, 0, 0, size, size, 0xDEADBEEF, 6) .. tables
   head = head:sub(1, 32) .. string.pack("<I4", crc32(head)) .. head:sub(37)
   return head .. stab .. ntab .. itab .. ptab .. etab .. entity .. comp
+end
+function w3._mesh_template(mesh, ecls, ccls)  -- a CEntityTemplate with one mesh component (measurements)
+  local t = w3.new("CEntityTemplate")
+  t.flatCompiledData = {mesh_entity_data(mesh, nil, ecls, ccls):byte(1, -1)}
+  return t
 end
 local placed = {}  -- entity address -> {mesh, scale, template}
 local function angles_arg(rot)
@@ -1907,6 +2351,94 @@ function w3.anim.pose(actor, layers)  -- layers = {{name, t, weight}, ...}; agai
 end
 function w3.anim.pose_clear(actor)
   return w3._anim_pose(animated(actor), {})
+end
+-- An animation made at run time for the actor's rig, without cooking: anim = {fps = 30, bones = {names},
+-- frames = {{bone1, bone2, ...}, ...}} with each bone {pos = {x, y, z}, rot = {x, y, z, w}, scale = {x, y, z}}
+-- (what is left out takes the rest pose's value), or raw = frames x bones x 10 float32 (position xyz, rotation xyzw,
+-- scale xyz; NaN = the rest pose's). Each bone local to its parent. It plays like the game's own (w3.anim.pose,
+-- w3.anim.sample, w3.anim.run); bones the rig lacks are left out, the rig's bones it does not name keep their pose.
+-- Returns how many bones fit.
+function w3.anim.create(actor, name, anim)
+  local raw = anim.raw
+  if not raw then
+    local nan, parts = 0 / 0, {}
+    for _, frame in ipairs(anim.frames or {}) do
+      for b = 1, #anim.bones do
+        local v = frame[b] or {}
+        local p, r, s = v.pos or {}, v.rot or {}, v.scale or {}
+        parts[#parts + 1] = string.pack("<ffffffffff", p[1] or nan, p[2] or nan, p[3] or nan, r[1] or nan, r[2] or nan,
+                                        r[3] or nan, r[4] or nan, s[1] or nan, s[2] or nan, s[3] or nan)
+      end
+    end
+    raw = table.concat(parts)
+  end
+  local n = w3._anim_create(animated(actor), name, anim.fps or 30, anim.bones, raw)
+  -- into the engine's lookup by name too (slot animations, scenes): an own new set in the figure's container
+  local ok, err = pcall(function()
+    local set = w3.new("CSkeletalAnimationSet")
+    w3._anim_publish(set, animated(actor), name)
+    w3.anim.add_set(actor, set)
+  end)
+  if not ok then print("w3.anim.create: " .. name .. " plays through w3.anim only: " .. tostring(err)) end
+  return n
+end
+-- Plays an animation (the game's or a made one) on the actor as a pose layer: opts = {loop = true, speed = 1,
+-- weight = 1}. Returns a handle for w3.anim.stop(h); without loop it stops by itself at the end.
+do
+  local running = {}
+  function w3.anim.run(actor, name, opts)
+    opts = opts or {}
+    local s = w3.anim.sample(actor, name, 0)
+    if not s then error("w3.anim.run: " .. tostring(select(2, w3.anim.sample(actor, name, 0))), 2) end
+    local h = {actor = actor, name = name, t0 = w3.time(), dur = s.duration, speed = opts.speed or 1,
+               weight = opts.weight or 1, loop = opts.loop ~= false}
+    h.tick = w3.on_tick(function()
+      local t = (w3.time() - h.t0) * h.speed
+      if h.dur > 0 and t > h.dur then
+        if not h.loop then w3.anim.stop(h) return end
+        t = t % h.dur
+      end
+      w3.anim.pose(h.actor, {{h.name, t, h.weight}})
+    end)
+    running[h] = true
+    return h
+  end
+  function w3.anim.stop(h)
+    if not running[h] then return end
+    running[h] = nil
+    w3.off_tick(h.tick)
+    pcall(w3.anim.pose_clear, h.actor)
+  end
+end
+-- A figure's proportions: per bone name {scale = s or {x, y, z}, inherit = true (the bones below grow with it),
+-- length = f (the distance to its parent), offset = {x, y, z}, rot = {x, y, z, w}} on its local
+-- pose every frame; children and every mesh follow. {} takes it off.
+function w3.anim.shape(actor, bones)
+  local c = animated(actor)
+  local r = w3._anim_shape(c, bones or {})
+  w3._shaped[w3.addr(c)] = next(bones or {}) and bones or nil  -- for w3.figure.look
+  return r
+end
+-- the bone names of a figure's rig (or of an animated component's: a head's CMimicComponent has the face's)
+function w3.anim.bones(actor) return w3._anim_bones(animated(actor)) end
+-- Recording a figure's pose, whatever moves it (the game, a scene, w3.anim.pose): w3.anim.record(actor [, maxSeconds])
+-- starts, w3.anim.record_stop(actor [, fps]) gives {fps, bones, raw} for w3.anim.create and w3.anim.save.
+function w3.anim.record(actor, maxSeconds) return w3._anim_record(animated(actor), maxSeconds or 60) end
+function w3.anim.record_stop(actor, fps) return w3._anim_record_stop(animated(actor), fps or 30) end
+-- An animation as a file: "TW3SEANIM 1", the fps, the bone names (one line, separated by commas), then the floats.
+function w3.anim.save(path, anim)
+  local ok, err = w3.fs.write(path, "TW3SEANIM 1\n" .. tostring(anim.fps or 30) .. "\n" .. table.concat(anim.bones, ",") .. "\n" .. anim.raw)
+  if not ok then error("w3.anim.save: " .. tostring(err), 2) end
+  return true
+end
+function w3.anim.load(path)
+  local s = w3.fs.read(path)
+  if not s then error("w3.anim.load: no file " .. path, 2) end
+  local head, fps, bones, at = s:match("^(TW3SEANIM 1)\n([^\n]*)\n([^\n]*)\n()")
+  if not head then error("w3.anim.load: " .. path .. " is no TW3SE animation", 2) end
+  local list = {}
+  for b in bones:gmatch("[^,]+") do list[#list + 1] = b end
+  return {fps = tonumber(fps) or 30, bones = list, raw = s:sub(at)}
 end
 -- The time of a running scene (for a scene preview with a playhead): where it stands, pause, seek forwards and
 -- backwards in the current section. The scene is the first running one, or the CStoryScenePlayer given last.
@@ -3114,68 +3646,122 @@ do
 
 )TW3SELIB" R"TW3SELIB(
   local function attr(k, v) return string.format(' %s="%s"', k, esc(v)) end
-  local function write_defs()
-    local mods = {}
-    for fid in pairs(defs) do mods[#mods + 1] = fid end
-    table.sort(mods)
+  local function ability_xml(n, a)
+    local out = {'  <ability' .. attr("name", n) .. '>'}
+    local stats = {}
+    for s in pairs(a.stats or {}) do stats[#stats + 1] = s end
+    table.sort(stats)
+    for _, s in ipairs(stats) do
+      local v = a.stats[s]
+      if type(v) ~= "table" then v = {min = v} end
+      out[#out + 1] = '    <' .. s .. attr("type", v.type or "add") .. attr("min", v.min or 0) ..
+                      (v.max and attr("max", v.max) or "") .. '/>'
+    end
+    for _, t in ipairs(a.tags or {}) do out[#out + 1] = '    <tags>' .. esc(t) .. '</tags>' end
+    out[#out + 1] = '  </ability>'
+    return table.concat(out, "\n")
+  end
+  local function item_xml(n, it)
+    local line = '  <item' .. attr("name", n) .. attr("category", it.category or "misc") .. attr("price", it.price or 1)
+    line = line .. attr("grid_size", it.grid_size or 1) .. attr("ability_slots", it.ability_slots or 0)
+    line = line .. attr("stackable", it.stackable or 1)
+    if it.icon then line = line .. attr("icon_path", it.icon) end
+    line = line .. attr("localisation_key_name", "tw3se_item_" .. n)
+    line = line .. attr("localisation_key_description", "tw3se_item_desc_" .. n)
+    local extra = {}
+    for k in pairs(it.attrs or {}) do extra[#extra + 1] = k end
+    table.sort(extra)
+    for _, k in ipairs(extra) do line = line .. attr(k, it.attrs[k]) end
+    local out = {line .. '>'}
+    if it.tags and #it.tags > 0 then out[#out + 1] = '    <tags>' .. esc(table.concat(it.tags, ", ")) .. '</tags>' end
+    if it.abilities and #it.abilities > 0 then
+      out[#out + 1] = '    <base_abilities>'
+      for _, a in ipairs(it.abilities) do out[#out + 1] = '      <a>' .. esc(a) .. '</a>' end
+      out[#out + 1] = '    </base_abilities>'
+    end
+    out[#out + 1] = '  </item>'
+    return table.concat(out, "\n")
+  end
+  local function sorted(t)
+    local names = {}
+    for n in pairs(t) do names[#names + 1] = n end
+    table.sort(names)
+    return names
+  end
+  local function merged()
+    local mods = sorted(defs)
     local d = {items = {}, abilities = {}}
     for _, fid in ipairs(mods) do
-      for n, v in pairs(defs[fid].items) do d.items[n] = v end
-      for n, v in pairs(defs[fid].abilities) do d.abilities[n] = v end
+      for n, v in pairs(defs[fid].items) do d.items[n] = item_xml(n, v) end
+      for n, v in pairs(defs[fid].abilities) do d.abilities[n] = ability_xml(n, v) end
     end
+    return d, mods
+  end
+  local function render(d, mods)
     local out = {'<?xml version="1.0" encoding="UTF-8"?>',
                  '<!-- Written by TW3SE from the w3.items calls of ' .. esc(table.concat(mods, ", ")) .. '. It comes again at each start. -->',
                  '<redxml>', '<definitions>', '<abilities>'}
-    local names = {}
-    for n in pairs(d.abilities) do names[#names + 1] = n end
-    table.sort(names)
-    for _, n in ipairs(names) do
-      local a = d.abilities[n]
-      out[#out + 1] = '  <ability' .. attr("name", n) .. '>'
-      local stats = {}
-      for s in pairs(a.stats or {}) do stats[#stats + 1] = s end
-      table.sort(stats)
-      for _, s in ipairs(stats) do
-        local v = a.stats[s]
-        if type(v) ~= "table" then v = {min = v} end
-        out[#out + 1] = '    <' .. s .. attr("type", v.type or "add") .. attr("min", v.min or 0) ..
-                        (v.max and attr("max", v.max) or "") .. '/>'
-      end
-      for _, t in ipairs(a.tags or {}) do out[#out + 1] = '    <tags>' .. esc(t) .. '</tags>' end
-      out[#out + 1] = '  </ability>'
-    end
+    for _, n in ipairs(sorted(d.abilities)) do out[#out + 1] = d.abilities[n] end
     out[#out + 1] = '</abilities>'
     out[#out + 1] = '<items>'
-    names = {}
-    for n in pairs(d.items) do names[#names + 1] = n end
-    table.sort(names)
-    for _, n in ipairs(names) do
-      local it = d.items[n]
-      local line = '  <item' .. attr("name", n) .. attr("category", it.category or "misc") .. attr("price", it.price or 1)
-      line = line .. attr("grid_size", it.grid_size or 1) .. attr("ability_slots", it.ability_slots or 0)
-      line = line .. attr("stackable", it.stackable or 1)
-      if it.icon then line = line .. attr("icon_path", it.icon) end
-      line = line .. attr("localisation_key_name", "tw3se_item_" .. n)
-      line = line .. attr("localisation_key_description", "tw3se_item_desc_" .. n)
-      local extra = {}
-      for k in pairs(it.attrs or {}) do extra[#extra + 1] = k end
-      table.sort(extra)
-      for _, k in ipairs(extra) do line = line .. attr(k, it.attrs[k]) end
-      out[#out + 1] = line .. '>'
-      if it.tags and #it.tags > 0 then out[#out + 1] = '    <tags>' .. esc(table.concat(it.tags, ", ")) .. '</tags>' end
-      if it.abilities and #it.abilities > 0 then
-        out[#out + 1] = '    <base_abilities>'
-        for _, a in ipairs(it.abilities) do out[#out + 1] = '      <a>' .. esc(a) .. '</a>' end
-        out[#out + 1] = '    </base_abilities>'
-      end
-      out[#out + 1] = '  </item>'
-    end
+    for _, n in ipairs(sorted(d.items)) do out[#out + 1] = d.items[n] end
     out[#out + 1] = '</items>'
     out[#out + 1] = '</definitions>'
     out[#out + 1] = '</redxml>'
     out[#out + 1] = ''
+    return table.concat(out, "\n")
+  end
+
+  -- At run time (measured in the game): a CR4DefinitionsDLCMounter made with w3.new loads its XML through vf46
+  -- (the definitions manager reads it, the mounter keeps the handle at +0x6c, +0x7c says loaded) and lets it go
+  -- through vf47. Items already in an inventory stay there. The game's DLC mount read tw3se_items.xml as it was at
+  -- this start (START); what a mod adds or changes after that goes into a file of its own in the depot, from memory,
+  -- and is mounted at once.
+  local START = w3.fs.read(ITEMS .. "\\tw3se_items.xml") or ""
+  local LIVE = "gameplay\\items\\tw3se_live_items.xml"
+  local mounts = {}  -- the mounters TW3SE made; held here so they live
+  function w3.items.mount(path)  -- a definitions XML in the depot, loaded now; the mounter, or nil and the reason
+    path = tostring(path):gsub("/", "\\"):lower()
+    -- (a path that is no file goes the mounter's way for folders, which faults on one the depot lacks)
+    if not w3._diskfile(path) then return nil, "no file " .. path .. " in the depot" end
+    local m = w3.new("CR4DefinitionsDLCMounter")
+    m.definitionXmlFilePath = path
+    w3.engine_call("CR4DefinitionsDLCMounter::vf46", "p>v", m)
+    if ((w3.peek(w3.addr(m) + 0x7c) or 0) & 0xff) == 0 then
+      w3.discard(m)
+      return nil, "not loaded: no such file or folder in the depot, or the game has no definitions yet"
+    end
+    mounts[m] = true
+    return m
+  end
+  function w3.items.unmount(m)  -- the definitions of a mount go again
+    if not mounts[m] then return false end
+    w3.engine_call("CR4DefinitionsDLCMounter::vf47", "p>v", m)
+    mounts[m] = nil
+    w3.discard(m)
+    return true
+  end
+  local live, pending = nil, false
+  local function sync_live()
+    pending = false
+    local d, mods = merged()
+    for _, kind in ipairs({"items", "abilities"}) do
+      for n, x in pairs(d[kind]) do if START:find(x, 1, true) then d[kind][n] = nil end end
+    end
+    if live then w3.items.unmount(live) live = nil end
+    if not next(d.items) and not next(d.abilities) then return end
+    local ok, err = w3.files.set(LIVE, render(d, mods), true)
+    if not ok then print("w3.items: " .. tostring(err)) return end
+    live, err = w3.items.mount(LIVE)
+    if not live then  -- (before the game is up: again a little later)
+      pending = true
+      w3._as("tw3se", w3.after, 2, sync_live)
+    end
+  end
+  local function write_defs()
+    local d, mods = merged()
     local file = ITEMS .. "\\tw3se_items.xml"
-    local xml = table.concat(out, "\n")
+    local xml = render(d, mods)
     w3.fs.mkdir(ITEMS)
     if w3.fs.read(file) ~= xml then
       local ok, err = w3.fs.write(file, xml)
@@ -3183,6 +3769,10 @@ do
     end
     local reddlc = DLC .. "\\dlctw3se.reddlc"
     if w3.fs.read(reddlc) ~= DLCTW3SE then w3.fs.write(reddlc, DLCTW3SE) end
+    if not SAFE and not pending then
+      pending = true
+      w3._as("tw3se", w3.after, 0, sync_live)
+    end
     return file
   end
   local function file_id()

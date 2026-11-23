@@ -170,6 +170,7 @@ void StartUp() {
     InstallScripting();
     InstallScriptStack();  // the script call stack with file and line, for faults, hangs and w3.script_stack()
     InstallQuarantine();   // freed memory held back with its free's stack (config quarantine; off by default)
+    InstallAttachFix();    // a node's attachment list under one lock (the crash after an upscaler change, 20.11.)
     InstallCatalog();  // `catalog`: all RTTI types and functions to a file
     InstallDump();     // `enginedump`: globals, vtables, object dumps, threads (compared with the REDkit editor's)
     InstallLua();  // Lua on top of the RTTI (`lua`, `luafile`, tw3se\lua\autorun)

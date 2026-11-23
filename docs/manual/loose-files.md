@@ -62,7 +62,8 @@ python tools\soundcache.py get "<game>\content\content0\soundspc.cache" gui.bnk 
 Save a file in `tw3se\files\` while the game runs, and the game reads the new version the next time it loads the
 file, for example at the next spawn of a template. TW3SE looks for changed files once a second.
 What is already in the world keeps the old version. Take a file away, and the game's own version comes back the same
-way. The console command `files` does the check at once and lists what it found; `w3.files.reload(path)` does it for
+way. A new file comes into the game at once when its folder is one of the game's (`gameplay\items\`); in a new folder
+it comes at the next start. The console command `files` does the check at once and lists what it found; `w3.files.reload(path)` does it for
 one file from Lua.
 
 At the next start the files go into the mod again.

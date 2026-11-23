@@ -1,5 +1,75 @@
 # Changelog
 
+## 1.4.2
+
+**Fixes:**
+
+- After a crash, tw3se.log names the place of the crash and the functions that called it. Before, only
+  crash_report.txt had them, written at the next start
+- A crash is in the crash report once (it was there twice)
+- The log calls the game version "found by signature". It said "unknown build", which read like a wrong game
+  version
+- `CSkeletalAnimationContainer::FindAnimation` is found in the game version 5.01. The `w3.anim` functions use it
+  (they had a slower lookup of their own)
+
+## 1.4.1
+
+**Fixes:**
+
+- A mesh whose vertices a plugin writes each frame (LiveMeshWrite) flickered: black spots, the world behind it
+  showing through. The vertices change once a frame now, before the frame is drawn
+- With Cleaner Witcher Senses Outlines (CWSO) the game froze in Witcher Senses while a plugin moved a mesh's
+  vertices (blend shapes, live meshes)
+
+## 1.4.0
+
+**New:**
+
+- `w3.engine_call(fn, sig, ...)` calls an engine function with integers, addresses, objects, strings, floats and
+  doubles (up to 16 arguments); `w3.engine_addr(name)` gives its offset
+- Engine functions by more names: a slot of a class's vtable (`"CEntity::vf140"`, found by the class's name in the
+  exe) or an offset in witcher3.exe (`"0x2263570"`), for `w3.engine_hook`, `w3.engine_call` and plugins
+- Interface 27: `EngineAddress(name)` and `EngineVtable(className, offset)`
+- `tools/enginemap.py` (in the SDK): every function, C++ class, vtable slot, call and text of witcher3.exe, searchable
+- `w3.anim.create(actor, name, anim)`: an animation for a figure's rig made at run time, from bone names and frames
+  (or float data read from a file), without cooking. The engine samples it like its own
+- `w3.anim.run(actor, name, opts)` plays an animation on a figure (loop, speed, weight), `w3.anim.stop(h)` ends it
+- Made animations are found by name like the game's own: `w3.anim.play` (slot animations) plays them
+- `w3.physics.body{...}`: bodies of your own in the world's physics (box, sphere, capsule; dynamic, kinematic or
+  static), with `w3.physics.pose`, `move`, `push`, `speed`, `remove` and `clear`
+- `w3.physics.joint(kind, a, b, opts)`: joints between bodies or to the world (ball, hinge, fixed, slider, rope with
+  length, spring and break force)
+- `w3.mem.alloc`, `read`, `write`, `free`: memory for `w3.engine_call`'s structs and out values. Engine functions
+  also by the text they print (`"text:..."`)
+- `w3.figure.parts(actor)`, `part`, `show`, `mesh`: a figure's look in parts (its own and its mounted items'), on,
+  off and with another mesh of the same skeleton
+- `w3.material.own(entity)`: one entity's materials of its own, so a material change counts for it alone
+- `w3.anim.shape(actor, bones)`: a figure's proportions by bone (scale, length, offset, turn; a scale for the whole
+  part below a bone or for the bone alone), on the figure every frame
+- `w3.anim.record(actor)` and `w3.anim.record_stop(actor, fps)` record a figure's pose as an animation;
+  `w3.anim.save(path, anim)` and `w3.anim.load(path)` keep it as a file
+- `w3.figure.look(actor)` and `w3.figure.apply(actor, look)`: a figure's look (shapes, parts, added parts) as a
+  table to keep with `w3.store` and put back
+- Dual quaternion skinning for a skinning hook slot: `w3.skinhook.dqs(slot, true)`, interface 28
+  `SkinHookDqs(slot, on)`. Joints that bend far keep their volume; bone scale works as in the game. With ray
+  tracing on, the ray traced picture uses it too
+- Interface 29, the skinning hook: 256 slots. `SkinHookOverlayRegion` puts several pictures side by side into the
+  skin overlay (a body, a head, a part with a UV of its own), up to 1448 x 1448 pixels. `SkinHookChunkSlot` draws one
+  chunk of a mesh with a slot of its own (a part whose UV overlaps the rest of the mesh)
+- `tw3se\shaders\blend.txt` changes how a pixel shader's pipelines blend (`<shader id> <target> alpha | alpha_all |
+  keep`)
+- `w3.figure.preview(actor, opts)` and `w3.figure.preview_end()`: the camera and a light on a figure, around it by
+  yaw
+- `w3.anim.bones(actor)` lists a rig's bones; `w3.anim.shape` on a head's `CMimicComponent` shapes the face (nose,
+  chin, eyes, cheeks, 180 bones on Geralt)
+- `w3.physics.parts(actor)`: a figure's bodies by bone name, for poses and joints (a rope at an NPC's hand)
+- `w3.figure.add(actor, mesh or template)` and `w3.figure.remove(handle)`: new parts on a figure that follow its
+  skeleton (clothing, hair, armour from any mesh or item template)
+- `w3.items.add` and `w3.items.ability` work at once while the game runs; a second call changes the item
+- `w3.items.mount(path)` and `w3.items.unmount(handle)` load an item XML of your own while the game runs
+- New loose files in `tw3se\files\` and `w3.files.set` on a new path are in the game at once (in a folder the game
+  has)
+
 ## 1.3.4
 
 **New:**

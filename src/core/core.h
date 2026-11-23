@@ -2,6 +2,7 @@
 #pragma once
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
+#include <array>
 #include <cstdint>
 #include <string>
 #include <tuple>
@@ -41,6 +42,15 @@ void PoseRestForget(void* skeleton);  // by address, for a rig object that is go
 // w3.anim.sample / w3.anim.pose: an animation of the figure's sets at second t, as a pose or laid on it every frame
 int PoseSample(void* component, const char* name, float t, TW3SE_Pose* out, float* duration, std::string* err);
 std::string PoseLayersSet(void* component, const std::vector<std::tuple<std::string, float, float>>& layers);
+// w3.anim.create: an engine animation for the component's rig, frames x bones x 10 floats; "" on success
+std::string AnimCreate(void* component, const char* name, float fps, const std::vector<std::string>& boneNames,
+                       const float* data, uint32_t frames, uint32_t* mapped);
+std::string AnimPublish(void* set, void* component, const char* name);  // into the engine's lookup by name
+std::string AnimRecordStart(void* component, float maxSeconds);         // w3.anim.record
+std::string AnimBoneNames(void* component, std::vector<std::string>* names);  // the rig's bone names
+// w3.anim.shape: per bone {scale xyz, offset xyz, rot xyzw, length, inherit} on the figure every frame; empty: off
+std::string AnimShapeSet(void* component, const std::vector<std::pair<std::string, std::array<float, 12>>>& bones);
+std::string AnimRecordStop(void* component, float fps, std::vector<std::string>* bones, std::vector<float>* data);
 std::string PoseLayerStats();
 void MimicRegisterCallback(TW3SE_MimicCallback cb, void* ctx);
 int MimicWatch(void* entity, int on);
@@ -64,6 +74,9 @@ bool IsRedkitEditor();              // running inside the REDkit editor.exe (fea
 // memClass is used by the editor build only (0x18 = what the engine passes for its CFunctions).
 void* EngineAlloc(size_t size, uint32_t align, uint16_t memClass = 0x18);
 uintptr_t Address(const char* name);  // 0 if unknown
+// enginecall.cpp: an engine function by an address-list name, "Class::vfN[@offset]" or "0x<rva>"; 0 and *err if none
+uintptr_t EngineResolve(const std::string& name, std::string* err);
+uintptr_t EngineVtable(const std::string& cls, uint32_t offset);  // a class's vtable from the exe's RTTI, 0 if none
 void ExeText(const uint8_t** begin, size_t* size);  // witcher3.exe's code section in memory (for own scans)
 uint32_t FieldOr(const char* name, uint32_t retail);  // a FIELD's value from the table, else the retail offset
 template <class T> T Fn(const char* name) { return reinterpret_cast<T>(Address(name)); }
@@ -256,6 +269,7 @@ int ScriptStackRead(ScriptStackFrameInfo* out, int max);  // this thread's, inne
 std::string ScriptStackText(bool mainThread);              // as lines for a log or report
 void ScriptStackOnFault(EXCEPTION_POINTERS* ep);           // a fault outside a guard: the stack to the log (3 times)
 void InstallQuarantine();                                  // config quarantine = hold | poison: freed memory held back
+void InstallAttachFix();                                 // config attach_fix (on): attachment lists changed by one thread at a time
 void InstallDred();                                        // config dred = on: D3D12 DRED before the game makes its device
 void DredOnPresent(void* swapChain, long hr);              // after each present: a device gone writes out\dred.txt
 void DredOnFault();                                        // a fault: the device gone writes out\dred.txt
@@ -288,6 +302,7 @@ std::string SetFileContents(const char* path, std::vector<uint8_t> bytes, bool d
 std::string ClearFileContents(const char* path, bool drop);                      // the game's own contents again
 std::string ReloadLooseFile(const char* path);                          // tw3se\files\<path> read again
 std::string FileAlias(const char* src, const char* dst);  // the bundled file under a second path too; "" or the reason
+std::string NewDiskFile(const char* path);               // a new file in the depot (contents: SetFileContents)
 
 // --- error reports: console.cpp builds the report, lua.cpp keeps the last Lua errors with their tracebacks
 std::string BuildReport(bool* written = nullptr);  // also written to tw3se\out\report.txt
@@ -336,6 +351,7 @@ void WriteCrashReport();  // after LoadConfig: crash_report.txt from them (nothi
 void StartSession();      // the marker tw3se\out\session.txt, once diag.cpp sees the process exit
 void SessionExit(long code, bool terminate);  // diag.cpp: code 0 deletes the marker, anything else goes into it
 void SessionFault(EXCEPTION_POINTERS* ep);    // editorprobe.cpp: a fault the game's crash handler gets (the first 3)
+void SessionNotesToLog();                     // diag.cpp: at an end that was not normal, the marker's notes into tw3se.log
 bool GuardableFault(DWORD code);              // editorprobe.cpp: an exception a TW3SE guard may take (not a stack overflow)
 std::string AddressPlace(uintptr_t a);        // scripting.cpp: "witcher3.exe+0x1234 (name)" for a log line
 void SessionNote(const char* what);           // a failure that ends with code 0 (hotreload.cpp: scripts that did not compile)
@@ -436,8 +452,9 @@ void DeformWatchEnd(int slot);
 bool DeformDrawHooksLive();  // IASetVertexBuffers of the game's lists is hooked and has run
 std::string DeformStats();
 void DeformNoteSubmitted(void* const* lists, UINT n);  // overlay.cpp's ExecuteCommandLists hook
-// overlay.cpp's ExecuteCommandLists hook, before the game's lists: blend shape work goes first on that queue.
+// overlay.cpp's ExecuteCommandLists hook: the game's queues counted (the one it submits the most is the blend shapes')
 void DeformBeforeSubmit(void* queue, unsigned lists);
+void DeformOnPresent();  // overlay.cpp's present hook: the blend shapes' work, recorded and submitted between frames
 
 // --- blendshape.cpp: blend shapes on a CRenderMesh (deltas from a TWDF file, weights from Lua)
 // A set from the file onto the mesh; `range` = the largest |weight| planned (the box grows for it). 0 + *err if not.
@@ -454,11 +471,14 @@ std::string IndexDump(uintptr_t renderMesh, const std::wstring& path, bool verti
 void BlendQueueRaw(void* res, uint64_t off, uint64_t size, const std::vector<uint8_t>& head,
                    const std::wstring& path);
 bool SkinHookCapture(int slot, const std::wstring& path, std::string* err);  // the RT skinning's positions of a slot
+bool SkinHookDqs(int slot, bool on, std::string* err);  // dual quaternion skinning for the slot's mesh
 bool SkinHookDeltaMush(int slot, int iterations, std::string* err);  // mush.cpp; iterations 0 = off
 bool SkinHookMushMask(int slot, int chunk, const float* mask, int count, std::string* err);
 std::string MushDump(int slot, const std::wstring& path);
 bool SkinHookOverlay(int slot, const void* rgba8, int size, std::string* err);  // the skin overlay of a slot
 bool SkinHookOverlayPlane(int slot, int plane, const void* rgba8, int size, std::string* err);  // 0 colour, 1 material
+bool SkinHookOverlayRegion(int slot, int plane, const void* rgba8, int size, int base, std::string* err);  // at base
+int SkinHookChunkSlot(int slot, int chunk, std::string* err);  // a chunk drawn with a slot of its own (an alias)
 int BlendResetAll();  // main thread, before the game rebuilds its render resources: every set ends, references back
 // Live meshes (interface 26): a set whose positions and normals come from a plugin each frame. LiveNew: its id
 // ("loading", no mesh yet); LiveAttach once the component's copy has its render mesh; BlendState gives its state.
@@ -486,7 +506,7 @@ std::string TexReadback(const char* depotPath, const std::wstring& outFile);  //
 std::vector<uint8_t> TexTestPicture(int w, int h, float t);
 // skinhook.cpp: the skinning shader hook (skin_hook = on, tw3se\shaders\skinhook.txt)
 void InstallSkinHook();
-int SkinHookAdd(uintptr_t renderMesh, std::string* err);  // its slot 1..8, 0 on an error
+int SkinHookAdd(uintptr_t renderMesh, std::string* err, bool low = false);  // its slot 1..256 (low: 1..8 first), 0 on an error
 bool SkinHookRemove(int slot);
 bool SkinHookCapsules(int slot, const float* caps, int n);  // n x (a.xyz, radius, b.xyz, strength), model space
 bool SkinHookCapsulesEx(int slot, const float* caps, int n);  // n x 12: ... strength, falloff, mode, 0, 0
@@ -620,6 +640,7 @@ int DropRenderIn(uintptr_t lo, uintptr_t hi);
 int RenderOnSubmit(TW3SE_SubmitCallback cb, void* ctx);
 void RenderBeforeSubmit(void* queue, void* gameQueue);  // overlay.cpp's ExecuteCommandLists hook
 void RenderOnPresent();                                 // overlay.cpp's present hook
+bool RenderPsoTrace(int frames, const std::wstring& path);   // 19.11.: w3._pso_trace (render.cpp)
 void OverlayApiText(float x, float y, uint32_t rgba, const char* text);
 void OverlayTextSize(const char* text, float* w, float* h);  // the overlay font's size of a text, in pixels
 void OverlayApiRect(float x, float y, float w, float h, uint32_t rgba);

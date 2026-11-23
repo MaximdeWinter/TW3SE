@@ -84,5 +84,6 @@ copy /y tools\gen_types.py "%SDK%\tools\gen_types.py" >nul
 copy /y tools\pack_mod.py "%SDK%\tools\pack_mod.py" >nul
 copy /y tools\bundle_extract.py "%SDK%\tools\bundle_extract.py" >nul
 copy /y tools\to_annotations.py "%SDK%\tools\to_annotations.py" >nul
+copy /y tools\enginemap.py "%SDK%\tools\enginemap.py" >nul
 
 echo packaged: %REL%

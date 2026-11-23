@@ -177,6 +177,92 @@ bool WindowOpen() {
     return until && (until == ~0ull || GetTickCount64() < until);
 }
 
+std::string Place(void* a);
+
+// 20.11.: a held block's poison, checked before it goes back. A changed word: something wrote into it after its free
+// (a stale pointer of the game or a mod) - the block, its free and what was written are logged (the first 40)
+std::atomic<int> g_writesLogged{0};
+std::atomic<uint64_t> g_writesFound{0};
+void CheckPoison(RbBuf* b, uint64_t rec) {
+    if (!g_rbPoison) return;
+    const Held& h = b->base[rec % kRbMax];
+    uint64_t pat = 0xdddd000000000000ull | (uint64_t(b->index & 0xff) << 40) | (rec & 0xffffffffffull);
+    size_t n = SmallBlockSize(h.p), len = n ? n : 8;
+    const char* p = static_cast<const char*>(h.p);
+    int bad = 0;
+    std::string what;
+    for (size_t o = 0; o + 8 <= len; o += 8) {
+        uint64_t v;
+        memcpy(&v, p + o, 8);
+        if (v == pat) continue;
+        if (bad < 8) {
+            char w[96];
+            snprintf(w, sizeof w, " +0x%zx=%016llx", o, static_cast<unsigned long long>(v));
+            what += w;
+            std::string pl = v > 0x10000 && (v >> 48) == 0 ? Place(reinterpret_cast<void*>(v)) : "?";
+            if (pl != "?") what += " (" + pl + ")";
+        }
+        ++bad;
+    }
+    if (!bad) return;
+    ++g_writesFound;
+    if (g_writesLogged.fetch_add(1) >= 40) return;
+    std::string st;
+    for (int i = 0; i < kFrames && h.frames[i]; ++i) st += "\n    " + Place(h.frames[i]);
+    Log("quarantine: WRITTEN after its free: block %p (%zu bytes), %d word(s) changed:%s - freed %.2f s before on "
+        "thread %lu, from:%s", h.p, len, bad, what.c_str(), (GetTickCount64() - h.tick) / 1000.0, b->tid, st.c_str());
+}
+
+// quarantine = small: one size class, every free of it, held by age (not by a window)
+size_t g_smallSize = 16;
+void SmallFree(void* p) {
+    RbBuf* b = t_rb ? t_rb : MyRb();
+    if (!b) return oFree(p);
+    t_inFree = true;
+    ULONGLONG now = GetTickCount64();
+    uint64_t head = b->head.load(std::memory_order_relaxed), ret = b->ret.load(std::memory_order_relaxed),
+             tail = b->tail.load(std::memory_order_relaxed);
+    int k = 0;
+    for (; k < 64 && ret < tail && now - b->base[ret % kRbMax].tick >= g_holdMs; ++k, ++ret) {  // the old ones back
+        CheckPoison(b, ret);
+        oFree(b->base[ret % kRbMax].p);
+    }
+    if (k) {
+        b->ret.store(ret, std::memory_order_release);
+        g_heldNow -= k;
+    }
+    if (tail - head == kRbMax) {  // full: the oldest record goes (its block first, if still held)
+        if (ret == head) {
+            CheckPoison(b, head);
+            oFree(b->base[head % kRbMax].p);
+            b->ret.store(++ret, std::memory_order_release);
+            --g_heldNow;
+        }
+        b->head.store(++head, std::memory_order_release);
+    }
+    if (tail < kRbMax && tail >= b->committed) {
+        size_t step = (1 << 20) / sizeof(Held);
+        if (!VirtualAlloc(b->base + b->committed, step * sizeof(Held), MEM_COMMIT, PAGE_READWRITE)) {
+            oFree(p);
+            t_inFree = false;
+            return;
+        }
+        b->committed += step;
+    }
+    Held& h = b->base[tail % kRbMax];
+    h.p = p;
+    h.tick = now;
+    RtlCaptureStackBackTrace(1, kFrames, h.frames, nullptr);
+    uint64_t pat = 0xdddd000000000000ull | (uint64_t(b->index & 0xff) << 40) | (tail & 0xffffffffffull);
+    for (size_t o = 0; o + 8 <= g_smallSize; o += 8) memcpy(static_cast<char*>(p) + o, &pat, 8);
+    b->tail.store(tail + 1, std::memory_order_release);
+    ++g_heldTotal;
+    int64_t c = ++g_heldNow, peak = g_heldPeak.load(std::memory_order_relaxed);
+    while (c > peak && !g_heldPeak.compare_exchange_weak(peak, c)) {
+    }
+    t_inFree = false;
+}
+
 void RebuildFree(void* p) {
     RbBuf* b = t_rb;
     t_inFree = true;  // the allocator's own bookkeeping goes through at once
@@ -185,6 +271,7 @@ void RebuildFree(void* p) {
                  tail = b->tail.load(std::memory_order_relaxed);
         if (tail - head == kRbMax) {  // full: the oldest record goes (its block first, if still held)
             if (ret == head) {
+                CheckPoison(b, head);
                 oFree(b->base[head % kRbMax].p);
                 b->ret.store(++ret, std::memory_order_release);
                 --g_heldNow;
@@ -223,6 +310,7 @@ void RebuildFree(void* p) {
         uint64_t ret = b->ret.load(std::memory_order_relaxed), tail = b->tail.load(std::memory_order_relaxed);
         int k = 0;
         for (; k < 256 && ret < tail; ++k, ++ret) {
+            CheckPoison(b, ret);
             oFree(b->base[ret % kRbMax].p);
             b->ret.store(ret + 1, std::memory_order_release);
         }
@@ -262,8 +350,10 @@ void RebuildTick(float, void*) {  // the log while the window is open or blocks 
     }
     active = false;
     Log("quarantine: rebuild window done after %.1f s: peak %lld block(s) held, private memory peak %zu MB (%+lld MB "
-        "over the start), now %zu MB", (now - g_openedAt) / 1000.0, static_cast<long long>(g_heldPeak.load()), g_mbPeak,
-        static_cast<long long>(g_mbPeak) - static_cast<long long>(g_mbAtOpen), mb);
+        "over the start), now %zu MB; %llu block(s) written after their free so far", (now - g_openedAt) / 1000.0,
+        static_cast<long long>(g_heldPeak.load()), g_mbPeak,
+        static_cast<long long>(g_mbPeak) - static_cast<long long>(g_mbAtOpen), mb,
+        static_cast<unsigned long long>(g_writesFound.load()));
     g_heldPeak = 0;
 }
 
@@ -289,6 +379,7 @@ std::deque<KeptGen> g_gens;         // one per rebuild, oldest first
 std::vector<void*> g_curCall;       // the rebuild call's frees, only its thread touches it until its AFTER
 ULONGLONG g_keepMs = 60000;
 std::atomic<ULONGLONG> g_lastRebuild{0};  // the AFTER of the series' last rebuild (0: no series)
+std::atomic<ULONGLONG> g_hcRebuildAt{0};  // the heap check's: the last rebuild's AFTER
 uint64_t g_keptNow = 0, g_seriesRebuilds = 0, g_seriesKept = 0, g_seriesDropped = 0;  // under g_keptMx
 constexpr uint64_t kKeptMax = 2500000;  // about 16 rebuilds: more, and the middle ones of the series go back at once
 constexpr size_t kBackPerTick = 20000;
@@ -329,6 +420,7 @@ void FreeHook(void* p) {
     }
     if (!p || t_inFree || !g_mode) return oFree(p);
     if (g_mode == 3) return RebuildFree(p);
+    if (g_mode == 4) return SmallBlockSize(p) == g_smallSize ? SmallFree(p) : oFree(p);
     ++g_frees;
     Ring* r = MyRing();
     if (!r) {
@@ -547,6 +639,7 @@ void QuarantineRebuild(int phase) {
         }
     }
     if (phase) g_lastRebuild = GetTickCount64();
+    if (phase) g_hcRebuildAt = GetTickCount64();
     if (g_keepRet) g_fixUntil = phase ? GetTickCount64() + 5000 : ~0ull;  // the resize fix's window
     if (g_mode != 3) return;
     if (!phase) {
@@ -594,6 +687,100 @@ void KeepTick(float, void*) {
     g_keptNow = 0;
     g_seriesRebuilds = g_seriesKept = g_seriesDropped = 0;
     g_lastRebuild = 0;
+}
+
+// ---- heap check (20.11.) ----
+size_t g_hcSize = 16;
+ULONGLONG g_hcEveryMs = 250;
+std::map<uintptr_t, int> g_hcReported;  // page -> 1 (main thread only)
+uint64_t g_hcScans = 0, g_hcPages = 0, g_hcLinks = 0;
+
+std::string HcBytes(uintptr_t a, size_t n) {
+    std::string r;
+    for (size_t o = 0; o < n; o += 8) {
+        uint64_t v = 0;
+        char line[160];
+        if (!SafeRead(reinterpret_cast<void*>(a + o), &v, 8)) {
+            snprintf(line, sizeof line, "\n      %016llx  ??", static_cast<unsigned long long>(a + o));
+            r += line;
+            continue;
+        }
+        char txt[9];
+        for (int i = 0; i < 8; ++i) {
+            unsigned char c = static_cast<unsigned char>(v >> (8 * i));
+            txt[i] = c >= 32 && c < 127 ? static_cast<char>(c) : '.';
+        }
+        txt[8] = 0;
+        snprintf(line, sizeof line, "\n      %016llx  %016llx  %s", static_cast<unsigned long long>(a + o),
+                 static_cast<unsigned long long>(v), txt);
+        r += line;
+        if (v > 0x10000 && (v >> 48) == 0) {
+            std::string pl = Place(reinterpret_cast<void*>(v));
+            if (pl != "?") r += "  " + pl;
+        }
+    }
+    return r;
+}
+
+// one page: its free list from the head (+0x40), each link on the grid of 16 and inside the page
+void HcPage(uintptr_t page) {
+    uint64_t link = 0;
+    if (!SafeRead(reinterpret_cast<void*>(page + 0x40), &link, 8)) return;
+    uintptr_t at = page + 0x40;  // where the link was read
+    for (int i = 0; i < 8192 && link; ++i) {
+        bool inPage = link >= page + 0x40 && link < page + 0x10000;
+        if (!inPage || (link & 0xf)) {
+            // read again: an allocation on another thread may have changed it in between
+            uint64_t again = 0;
+            if (!SafeRead(reinterpret_cast<void*>(at), &again, 8) || again != link) return;
+            if (g_hcReported.count(page)) return;
+            g_hcReported[page] = 1;
+            ULONGLONG rb = g_hcRebuildAt.load();
+            char head[320];
+            snprintf(head, sizeof head, "heap check: a CROOKED free-list link in the %zu-byte page %p: at %p (the %d. link) "
+                     "stands %016llx (%s)%s", g_hcSize, reinterpret_cast<void*>(page), reinterpret_cast<void*>(at), i,
+                     static_cast<unsigned long long>(link), inPage ? "off the grid" : "outside the page",
+                     rb ? (", " + std::to_string((GetTickCount64() - rb) / 1000.0) + " s after the last graphics rebuild").c_str()
+                        : ", no graphics rebuild yet");
+            Log("%s; the bytes around the block holding it:%s\n    and around the value:%s", head,
+                HcBytes((at & ~uintptr_t(0xf)) - 0x40, 0x80).c_str(), HcBytes((link & ~uintptr_t(0xf)) - 0x20, 0x50).c_str());
+            return;
+        }
+        at = static_cast<uintptr_t>(link);
+        ++g_hcLinks;
+        if (!SafeRead(reinterpret_cast<void*>(at), &link, 8)) return;
+    }
+}
+
+void HeapCheckTick(float, void*) {
+    static ULONGLONG last = 0, lastLog = 0;
+    ULONGLONG now = GetTickCount64();
+    if (now - last < g_hcEveryMs || !g_allocator) return;
+    last = now;
+    uintptr_t a = *g_allocator & ~uintptr_t(7);
+    if (!a) return;
+    uintptr_t lo = *reinterpret_cast<const uintptr_t*>(a + 0xc900), hi = *reinterpret_cast<const uintptr_t*>(a + 0xc908);
+    ++g_hcScans;
+    for (uintptr_t r = lo; r < hi;) {
+        MEMORY_BASIC_INFORMATION mi{};
+        if (!VirtualQuery(reinterpret_cast<void*>(r), &mi, sizeof mi)) break;
+        uintptr_t end = reinterpret_cast<uintptr_t>(mi.BaseAddress) + mi.RegionSize;
+        if (mi.State == MEM_COMMIT && !(mi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+            for (uintptr_t p = (r + 0xffff) & ~uintptr_t(0xffff); p + 0x48 <= end && p < hi; p += 0x10000) {
+                uint32_t size = 0;
+                if (!SafeRead(reinterpret_cast<void*>(p + 0x20), &size, 4) || size != g_hcSize) continue;
+                ++g_hcPages;
+                HcPage(p);
+            }
+        }
+        r = end > r ? end : r + 0x10000;
+    }
+    if (now - lastLog >= 30000) {
+        lastLog = now;
+        Log("heap check: %llu scan(s), %llu page visit(s), %llu link(s) followed, %zu crooked page(s) so far",
+            static_cast<unsigned long long>(g_hcScans), static_cast<unsigned long long>(g_hcPages),
+            static_cast<unsigned long long>(g_hcLinks), g_hcReported.size());
+    }
 }
 
 // The reader: the faulting instruction and up to 10 callers, unwound from the fault's context
@@ -658,7 +845,7 @@ void QuarantineOnFault(EXCEPTION_POINTERS* ep) {
 
 void InstallQuarantine() {
     std::string m = ConfigGet("quarantine", "off");
-    g_mode = m == "poison" ? 2 : m == "hold" || m == "on" ? 1 : m == "rebuild" ? 3 : 0;
+    g_mode = m == "poison" ? 2 : m == "hold" || m == "on" ? 1 : m == "rebuild" ? 3 : m == "small" ? 4 : 0;
     RegisterCommand("quarantine", &CmdQuarantine, "quarantine [find <hex address>]: freed memory held back (config quarantine = hold | poison)");
     g_keepCall = ConfigBool("rebuild_fix", true);
     if (ConfigBool("resize_fix", true))
@@ -686,6 +873,13 @@ void InstallQuarantine() {
             }
     }
     if (g_keepRet || g_keepCall) RegisterTick(&KeepTick, nullptr);
+    if (ConfigBool("heap_check", false) && g_allocator) {
+        g_hcSize = static_cast<size_t>(atoi(ConfigGet("heap_check_size", "16").c_str()));
+        g_hcEveryMs = static_cast<ULONGLONG>(atoi(ConfigGet("heap_check_ms", "250").c_str()));
+        RegisterTick(&HeapCheckTick, nullptr);
+        Log("heap check: on - the %zu-byte pages' free lists walked every %llu ms", g_hcSize,
+            static_cast<unsigned long long>(g_hcEveryMs));
+    }
     if (!g_mode) {
         if (!g_keepRet && !g_keepCall) return;
         void* target = reinterpret_cast<void*>(Address("Memory::Free"));
@@ -702,7 +896,11 @@ void InstallQuarantine() {
     Log("resize fix %s, rebuild fix %s", g_keepRet ? "on" : "off", g_keepCall ? "on" : "off");
     g_holdMs = static_cast<ULONGLONG>(atof(ConfigGet("quarantine_seconds", g_mode == 3 ? "10" : "5").c_str()) * 1000);
     if (g_mode == 3) RegisterTick(&RebuildTick, nullptr);
-    g_rbPoison = g_mode == 3 && ConfigBool("quarantine_poison", false);
+    g_rbPoison = (g_mode == 3 && ConfigBool("quarantine_poison", false)) || g_mode == 4;
+    if (g_mode == 4) {
+        g_smallSize = static_cast<size_t>(atoi(ConfigGet("quarantine_small_size", "16").c_str()));
+        RegisterTick(&RebuildTick, nullptr);  // (its log: blocks held, writes found)
+    }
     std::string only = ConfigGet("quarantine_only", "all");
     g_onlyMods = only != "all";
     if (g_onlyMods && only != "mods") {
@@ -721,6 +919,11 @@ void InstallQuarantine() {
     if (!target || !Hook(target, reinterpret_cast<void*>(&FreeHook), reinterpret_cast<void**>(&oFree))) {
         g_mode = 0;
         Log("quarantine: Memory::Free not hooked - off");
+        return;
+    }
+    if (g_mode == 4) {
+        Log("quarantine: small - every freed %zu-byte block held %.1f s, poisoned, with its stack; a write into it after "
+            "its free is logged when it goes back", g_smallSize, g_holdMs / 1000.0);
         return;
     }
     if (g_mode == 3) {

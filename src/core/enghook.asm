@@ -62,4 +62,55 @@ ENGTHUNK 13
 ENGTHUNK 14
 ENGTHUNK 15
 
+; uint64 tw3se_engcall(void* fn, const uint64* regs, const uint64* stack, uint64 nstack, uint64* xmm0Out)
+; Calls an engine function for w3.engine_call (lua.cpp): regs = rcx, rdx, r8, r9, then the bits of xmm0-xmm3 (eight
+; qwords; by Windows x64 the k-th argument goes to the k-th integer or float register); stack = the arguments from the
+; fifth on. Returns rax; xmm0's low qword goes to *xmm0Out. rbp keeps the frame, so the stack area may have any size.
+tw3se_engcall PROC FRAME
+    push rbp
+    .pushreg rbp
+    push rsi
+    .pushreg rsi
+    push rdi
+    .pushreg rdi
+    push rbx
+    .pushreg rbx
+    mov rbp, rsp
+    .setframe rbp, 0
+    .endprolog
+    mov r10, rcx
+    mov rsi, rdx
+    mov rbx, [rbp+48h]
+    mov rax, r9
+    shl rax, 3
+    add rax, 20h
+    sub rsp, rax
+    and rsp, -16
+    xor ecx, ecx
+copy_args:
+    cmp rcx, r9
+    jae args_done
+    mov rdx, [r8+rcx*8]
+    mov [rsp+20h+rcx*8], rdx
+    inc rcx
+    jmp copy_args
+args_done:
+    mov rcx, [rsi]
+    mov rdx, [rsi+8]
+    mov r8, [rsi+10h]
+    mov r9, [rsi+18h]
+    movq xmm0, qword ptr [rsi+20h]
+    movq xmm1, qword ptr [rsi+28h]
+    movq xmm2, qword ptr [rsi+30h]
+    movq xmm3, qword ptr [rsi+38h]
+    call r10
+    movq qword ptr [rbx], xmm0
+    mov rsp, rbp
+    pop rbx
+    pop rdi
+    pop rsi
+    pop rbp
+    ret
+tw3se_engcall ENDP
+
 END

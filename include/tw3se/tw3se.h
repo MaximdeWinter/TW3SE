@@ -37,11 +37,11 @@
 #endif
 #define TW3SE_EXPORT TW3SE_EXTERN_C __declspec(dllexport)
 
-#define TW3SE_INTERFACE_VERSION 26
+#define TW3SE_INTERFACE_VERSION 29
 
 #define TW3SE_VERSION_MAJOR 1
-#define TW3SE_VERSION_MINOR 3
-#define TW3SE_VERSION_PATCH 4
+#define TW3SE_VERSION_MINOR 4
+#define TW3SE_VERSION_PATCH 2
 
 typedef struct TW3SE_PluginInfo {
     uint32_t infoVersion;      /* set by TW3SE: 1 */
@@ -700,6 +700,37 @@ typedef struct TW3SE_Interface {
        a size: the plane clear. A size other than the colour's clears the colour (and the other way round). Needs
        the shaders of skin_build.py (skinhook.txt `overlay 2`); with older ones it does nothing. */
     int (*SkinHookOverlayMaterial)(int slot, const void* rgba8, int size);
+
+    /* ---- interface 27 ---- */
+
+    /* EngineAddress: an engine function by name, NULL if there is none (LastError says why). The name is one of
+       GetAddress's, a class's vtable slot ("CEntity::vf140", "CEntity::vf0@10" for the vtable at offset 0x10 of the
+       object), found by the class's name in the exe's RTTI, or an offset in the exe ("0x2263570"). Any thread. */
+    void* (*EngineAddress)(const char* name);
+
+    /* EngineVtable: a class's vtable from the exe's RTTI (offset 0 = the main one), NULL if the exe has none. */
+    void* (*EngineVtable)(const char* className, uint32_t offset);
+
+    /* ---- interface 28 ---- */
+
+    /* SkinHookDqs: dual quaternion skinning for a slot's mesh (on 1, off 0). The patched shaders skin it anew from the
+       game's bones and the mesh's weights; joints keep their volume where linear skinning folds them in. Delta Mush
+       and the capsules work on top of it. Needs the shaders of skin_build.py (skinhook.txt `dqs 1`). Any thread;
+       from the next frame on. */
+    int (*SkinHookDqs)(int slot, int on);
+
+    /* ---- interface 29 ---- */
+
+    /* SkinHookOverlayRegion: a plane (0 colour, 1 material) of a slot's overlay at a place the caller lays out: `base`
+       texels from the start of the buffer all pictures share (2097152 texels a plane), `size` x `size`, at the mesh's
+       UV. Several pictures side by side (a body, a head, a piece with a UV of its own); the caller keeps them apart.
+       Any slot, an alias of SkinHookChunkSlot too. NULL with a size: the plane clear; size 0: the overlay off. */
+    int (*SkinHookOverlayRegion)(int slot, int plane, const void* rgba8, int size, int base);
+
+    /* SkinHookChunkSlot: a chunk of a slot's mesh drawn with a slot of its own - the same skinning (capsules, DQS),
+       its own overlay (SkinHookOverlayRegion), for a chunk whose UV overlaps the others'. Answers the alias slot (the
+       same one again for the same chunk), 0 on an error. chunk -1: the slot's aliases gone. Any thread. */
+    int (*SkinHookChunkSlot)(int slot, int chunk);
 } TW3SE_Interface;
 
 /* Whether the running extender has `field` (a function added after interface 25):

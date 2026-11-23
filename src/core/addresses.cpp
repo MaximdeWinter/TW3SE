@@ -414,8 +414,11 @@ bool ResolveAddresses() {
     const bool known = GameBuild() == kKnownBuild;
     int missing = ResolveTables(kFuncs, std::size(kFuncs), kCalls, std::size(kCalls), kGlobals, std::size(kGlobals),
                                 kFields, std::size(kFields), known);
-    Log("addresses: %zu functions, %zu calls, %zu globals, %zu fields, %d missing (%s build %08x)", std::size(kFuncs),
-        std::size(kCalls), std::size(kGlobals), std::size(kFields), missing, known ? "known" : "unknown", GameBuild());
+    // (the build named here is the one TW3SE was made on; any other build is read by signature, which is the normal
+    // case after a game patch. 23.11.: "unknown build" read to a player like the wrong game version)
+    Log("addresses: %zu functions, %zu calls, %zu globals, %zu fields, %d missing (build %08x, %s)", std::size(kFuncs),
+        std::size(kCalls), std::size(kGlobals), std::size(kFields), missing, GameBuild(),
+        known ? "the reference build" : "found by signature");
     if (!g_optMissing.empty()) Log("addresses: not in this build, the features that need them stay off: %s", g_optMissing.c_str());
     return missing == 0;
 }

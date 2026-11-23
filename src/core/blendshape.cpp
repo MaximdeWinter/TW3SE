@@ -34,6 +34,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -1734,15 +1735,35 @@ bool IsMainQueue(ID3D12CommandQueue* q, unsigned lists) {
     return q == g_mainQueue;
 }
 
+// (a plugin's live mesh flickered - black spots, the world behind showing through, fast; gone with the game paused):
+// the live meshes' copy went ahead of whichever of the game's submits came next, also in the middle of a
+// frame - its depth pass drew the body of before, its colour pass the new one. A live mesh writes once a frame now,
+// ahead of the game's first submit after a Present, so every pass of a frame sees the same vertices
+std::atomic<bool> g_liveFrame{true};
+
+// (with CWSO, Witcher Senses froze the game while a plugin moved a mesh's vertices; measured in the game, thread stacks):
+// the work went in the ExecuteCommandLists hook - the game's submit came through CWSO's hook first, which holds its lock
+// while it draws its outlines, then Streamline, then ours; our list's Reset went into CWSO's Reset hook and waited for
+// that same lock. Inside another mod's submit hook no list of ours is touched any more: the submit hook only counts
+// the queues, the work is recorded and submitted from the Present hook - after the frame's lists, before the next
+// frame's (which is also when a live mesh has to write)
 void DeformBeforeSubmit(void* queue, unsigned lists) {
     if (t_inSubmit) return;
     std::lock_guard<std::mutex> lock(g_mx);
-    if (!IsMainQueue(static_cast<ID3D12CommandQueue*>(queue), lists)) return;
+    IsMainQueue(static_cast<ID3D12CommandQueue*>(queue), lists);
+}
+
+void DeformOnPresent() {
+    g_liveFrame.store(true, std::memory_order_relaxed);
+    if (t_inSubmit) return;
+    std::lock_guard<std::mutex> lock(g_mx);
+    ID3D12CommandQueue* queue = g_mainQueue;
+    if (!queue) return;
     if (g_sets.empty() && g_dumps.empty() && g_retire.empty() && g_retireRm.empty() && !TexWritesPending() &&
         !MushActive())
         return;
     uint64_t t0 = Micros();
-    SubmitWork(static_cast<ID3D12CommandQueue*>(queue));
+    SubmitWork(queue);
     uint64_t dt = Micros() - t0;
     ++g_tCalls;
     g_tTotal += dt;
@@ -1761,6 +1782,9 @@ std::string BlendStats() {
 void SubmitWork(ID3D12CommandQueue* q) {
     if (q->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT) return;
     g_queue = q;
+    const bool liveNow = g_liveFrame.exchange(false, std::memory_order_relaxed);  // the frame's first submit
+    // a live mesh's write (its copy into the game's buffer) waits for that; loading it and giving it back do not
+    auto waits = [liveNow](const Set& s) { return s.live && s.ready && !s.unload && !liveNow; };
     if (!InitWriter(q)) {
         for (auto& e : g_sets)
             if (e.second->heldRm) RetireRenderMesh(e.second->rm);
@@ -1830,7 +1854,7 @@ void SubmitWork(ID3D12CommandQueue* q) {
             it = g_sets.erase(it);
             continue;
         }
-        if (!s.lost && (!s.ready || s.dirty || s.unload)) work = true;
+        if (!s.lost && (!s.ready || s.dirty || s.unload) && !waits(s)) work = true;
         ++it;
     }
     for (auto& d : g_dumps)
@@ -1847,7 +1871,7 @@ void SubmitWork(ID3D12CommandQueue* q) {
     std::vector<std::pair<uintptr_t, Box>> boxes;
     for (auto& e : g_sets) {
         Set& s = *e.second;
-        if (!s.rm || s.lost || !(!s.ready || s.dirty || s.unload)) continue;
+        if (!s.rm || s.lost || !(!s.ready || s.dirty || s.unload) || waits(s)) continue;
         RecordSet(l, s, weightAt, slot);
         if (s.lost) continue;
         // still waiting for the game's draw: nothing written, the mesh keeps its box (the grown box on vertices still

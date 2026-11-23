@@ -151,6 +151,7 @@ void OnPresentCommon(void* swapChain, const char* which) {
     }
     FirePresent(swapChain);
     RenderOnPresent();
+    DeformOnPresent();
 }
 
 HRESULT STDMETHODCALLTYPE PresentHook(IDXGISwapChain3* sc, UINT sync, UINT flags) {

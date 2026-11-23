@@ -108,6 +108,86 @@ void Visit(D3D12_SHADER_BYTECODE& bc, const wchar_t* stage) {
     }
 }
 
+// (a plugin's decals cut off at half alpha): every pipeline's note (its shaders, its targets and
+// their blend, its depth writes) for the trace of what a few frames set (render.cpp, w3._pso_trace); and blend rules
+// from tw3se\shaders\blend.txt, a line each:  <ps id> <target 0-7> alpha | alpha_all | keep
+//   alpha      the target's colour blended by the shader's alpha (its alpha channel kept)
+//   alpha_all  its alpha channel blended the same way too
+//   keep       the target not written
+std::mutex g_noteMx;
+std::unordered_map<void*, std::string> g_psoNotes;
+struct BlendRule {
+    uint64_t ps;
+    int rt;
+    int mode;  // 0 alpha, 1 alpha_all, 2 keep
+};
+std::vector<BlendRule> g_blendRules;
+
+void LoadBlendRules() {
+    g_blendRules.clear();
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, (g_dir + L"blend.txt").c_str(), L"r") || !f) return;
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        unsigned long long id = 0;
+        int rt = -1;
+        char mode[32] = {};
+        if (line[0] == '#' || sscanf_s(line, "%llx %d %31s", &id, &rt, mode, (unsigned)sizeof mode) != 3) continue;
+        if (rt < 0 || rt > 7) continue;
+        int m = !strcmp(mode, "alpha") ? 0 : !strcmp(mode, "alpha_all") ? 1 : !strcmp(mode, "keep") ? 2 : -1;
+        if (m >= 0) g_blendRules.push_back({id, rt, m});
+    }
+    fclose(f);
+    if (!g_blendRules.empty()) Log("shaders: %zu blend rules (tw3se\\shaders\\blend.txt)", g_blendRules.size());
+}
+
+// the rules for this pixel shader on the pipeline's blend state -> how many applied
+int ApplyBlend(D3D12_GRAPHICS_PIPELINE_STATE_DESC& d, uint64_t ps) {
+    int n = 0;
+    for (const BlendRule& r : g_blendRules) {
+        if (r.ps != ps) continue;
+        D3D12_BLEND_DESC& b = d.BlendState;
+        if (!b.IndependentBlendEnable) {
+            for (int i = 1; i < 8; ++i) b.RenderTarget[i] = b.RenderTarget[0];
+            b.IndependentBlendEnable = TRUE;
+        }
+        D3D12_RENDER_TARGET_BLEND_DESC& t = b.RenderTarget[r.rt];
+        if (r.mode == 2) {
+            t.RenderTargetWriteMask = 0;
+        } else {
+            t.BlendEnable = TRUE;
+            t.LogicOpEnable = FALSE;
+            t.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+            t.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+            t.BlendOp = D3D12_BLEND_OP_ADD;
+            t.SrcBlendAlpha = r.mode == 1 ? D3D12_BLEND_SRC_ALPHA : D3D12_BLEND_ZERO;
+            t.DestBlendAlpha = r.mode == 1 ? D3D12_BLEND_INV_SRC_ALPHA : D3D12_BLEND_ONE;
+            t.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+            if (!t.RenderTargetWriteMask) t.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        }
+        ++n;
+    }
+    return n;
+}
+
+void NotePso(void* pso, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& d, uint64_t vs, uint64_t ps, int blended) {
+    char b[160];
+    snprintf(b, sizeof b, "vs=%016llx ps=%016llx rts=%u depth=%d/%d", static_cast<unsigned long long>(vs),
+             static_cast<unsigned long long>(ps), d.NumRenderTargets, d.DepthStencilState.DepthEnable ? 1 : 0,
+             d.DepthStencilState.DepthWriteMask ? 1 : 0);
+    std::string s = b;
+    for (UINT i = 0; i < d.NumRenderTargets && i < 8; ++i) {
+        const D3D12_RENDER_TARGET_BLEND_DESC& t = d.BlendState.RenderTarget[d.BlendState.IndependentBlendEnable ? i : 0];
+        snprintf(b, sizeof b, " rt%u=f%d:%s%d/%d:m%x", i, d.RTVFormats[i], t.BlendEnable ? "b" : "-", t.SrcBlend,
+                 t.DestBlend, t.RenderTargetWriteMask);
+        s += b;
+    }
+    if (d.BlendState.AlphaToCoverageEnable) s += " a2c";
+    if (blended) s += " (blend.txt)";
+    std::lock_guard<std::mutex> l(g_noteMx);
+    g_psoNotes[pso] = std::move(s);
+}
+
 std::unordered_set<std::string> g_pairs;  // the shader combinations written to dump\pipelines.txt
 
 // Root signatures (dump mode): the game makes them from serialized blobs (no shader carries one); each gets an id
@@ -331,11 +411,18 @@ HRESULT STDMETHODCALLTYPE GfxHook(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELI
     Visit(d.DS, L"ds");
     Visit(d.HS, L"hs");
     Visit(d.GS, L"gs");
-    HRESULT hr = oGfx(dev, &d, riid, out);
-    if (FAILED(hr) && g_replaced.load() != before) {  // a replacement the device refused: the game's own shaders
-        Log("shaders: a pipeline with a replaced shader was refused (0x%08lx) - it keeps the game's shaders", hr);
-        hr = oGfx(dev, desc, riid, out);
+    int blended = 0;
+    {
+        std::lock_guard<std::mutex> l(g_mx);
+        if (!g_blendRules.empty()) blended = ApplyBlend(d, IdOf(desc->PS));
     }
+    HRESULT hr = oGfx(dev, &d, riid, out);
+    if (FAILED(hr) && (g_replaced.load() != before || blended)) {  // a replacement the device refused: the game's own
+        Log("shaders: a pipeline with a replaced shader or blend was refused (0x%08lx) - it keeps the game's", hr);
+        hr = oGfx(dev, desc, riid, out);
+        blended = 0;
+    }
+    if (SUCCEEDED(hr) && out && *out) NotePso(*out, blended ? d : *desc, IdOf(desc->VS), IdOf(desc->PS), blended);
     if (SUCCEEDED(hr) && out && *out) {
         TW3SE_PipelineInfo info = {};
         info.pipelineState = *out;
@@ -436,7 +523,15 @@ void InstallShaders() {
         CreateDirectoryW(g_dumpDir.c_str(), nullptr);
     }
     std::lock_guard<std::mutex> l(g_mx);
+    LoadBlendRules();
     HookDevice();
+}
+
+// 19.11.: a pipeline's note (vs, ps, targets, blend) for the trace, "" when unknown
+std::string ShadersPsoNote(void* pso) {
+    std::lock_guard<std::mutex> l(g_noteMx);
+    auto it = g_psoNotes.find(pso);
+    return it == g_psoNotes.end() ? std::string() : it->second;
 }
 
 // --- the render API of plugins (render.cpp, 1.2): the same hooks, also without tw3se\shaders or shader_dump ---
