@@ -57,8 +57,8 @@ Mods\modBetterWolves\
 `require` finds the mod's own modules first, by the name with dots for folders. Each mod keeps its own: two mods can
 each have a `util.lua`. Any other name comes from `tw3se\lua\` (`require("lib.w3util")`).
 
-A mod switched off in the game's `mods.settings` (`Enabled=0`) is off for TW3SE too. Two mod folders with the same
-name: the one in `tw3se\mods` counts, and `tw3se.log` names the other.
+A mod switched off in the game's `mods.settings` (`Enabled=0` or `Enabled=false`) is off for TW3SE too. Two mod
+folders with the same name: the one in `tw3se\mods` counts, and `tw3se.log` names the other.
 
 ## Objects
 

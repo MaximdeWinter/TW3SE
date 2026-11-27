@@ -3,13 +3,14 @@
 // A mod's TW3SE part is a folder: bin\x64_dx12\tw3se\mods\<name>\, or <game>\Mods\<modName>\tw3se\ beside the mod's
 // own content\ (where Vortex and a player unpacking by hand put a mod anyway). The folder holds init.lua (a Lua mod),
 // natives\*.lua (w3.native before the scripts load), files\ (loose files) and the modules its require() loads. A mod
-// in Mods that the game's mods.settings switches off (Enabled=0) is off for TW3SE too. Two folders with the same name:
-// the one in tw3se\mods counts, the other is named in the log once.
+// in Mods that the game's mods.settings switches off (Enabled=0 or false) is off for TW3SE too. Two folders with the
+// same name: the one in tw3se\mods counts, the other is named in the log once.
 #include "core.h"
 
 #include <shlobj.h>
 
 #include <algorithm>
+#include <cctype>
 #include <mutex>
 #include <set>
 
@@ -100,7 +101,13 @@ const std::set<std::wstring>& SwitchedOff(const std::wstring& path) {
         } else if (!section.empty()) {
             std::string l = line;
             l.erase(std::remove(l.begin(), l.end(), ' '), l.end());
-            if (_strnicmp(l.c_str(), "Enabled=", 8) == 0 && atoi(l.c_str() + 8) == 0) g_off.insert(section);
+            // (5.02 writes Enabled=false / true where 5.01 wrote 0 / 1 - atoi read "true" as 0, a mod switched on again
+            // in the game's Mods menu stayed off for TW3SE: off is 0 or false, anything else on)
+            if (_strnicmp(l.c_str(), "Enabled=", 8) == 0) {
+                const char* v = l.c_str() + 8;
+                if (_stricmp(v, "false") == 0 || (isdigit(static_cast<unsigned char>(*v)) && atoi(v) == 0))
+                    g_off.insert(section);
+            }
         }
     }
     return g_off;
@@ -145,7 +152,7 @@ std::vector<ModFolder> ModFolders() {
     return out;
 }
 
-// A mod folder of <game>\Mods that mods.settings switches off (Enabled=0): the game leaves its scripts out too
+// A mod folder of <game>\Mods that mods.settings switches off (Enabled=0 or false): the game leaves its scripts out too
 bool GameModSwitchedOff(const std::wstring& name) {
     std::wstring n = name;
     std::transform(n.begin(), n.end(), n.begin(), towlower);
