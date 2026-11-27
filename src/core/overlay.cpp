@@ -128,6 +128,38 @@ bool IsGameSwapChain(void* swapChain) {
 std::atomic<unsigned> g_presentsGame{0}, g_presentsOther{0}, g_ovCalls{0};
 std::atomic<const char*> g_ovWhy{"no present yet"};
 
+// The game in the background (26.11.: another window in front, the game kept running - cj_core's keeprun, or a mod
+// that wants it - drew at full speed on the graphics card): each frame waits here until 1/fps has passed since the
+// last, so the card draws only that many. In front it never waits. tw3se.config background_fps (20 by default, 0 =
+// off); w3.background_fps(n) sets it while the game runs.
+std::atomic<int> g_bgFps{-1};
+int BackgroundFps() {
+    int v = g_bgFps.load();
+    if (v < 0) {
+        v = atoi(ConfigGet("background_fps", "20").c_str());
+        if (v < 0) v = 0;
+        g_bgFps = v;
+    }
+    return v;
+}
+void ThrottleInBackground() {
+    static LARGE_INTEGER freq{}, last{};
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    int fps = BackgroundFps();
+    DWORD pid = 0;
+    GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+    if (fps <= 0 || pid == GetCurrentProcessId() || !last.QuadPart) {
+        last = now;
+        return;
+    }
+    double gone = double(now.QuadPart - last.QuadPart) / double(freq.QuadPart);
+    double wait = 1.0 / fps - gone;
+    if (wait > 0.001) Sleep(DWORD(wait * 1000.0));
+    QueryPerformanceCounter(&last);
+}
+
 void OnPresentCommon(void* swapChain, const char* which) {
     if (!IsGameSwapChain(swapChain)) {
         ++g_presentsOther;
@@ -152,6 +184,7 @@ void OnPresentCommon(void* swapChain, const char* which) {
     FirePresent(swapChain);
     RenderOnPresent();
     DeformOnPresent();
+    ThrottleInBackground();
 }
 
 HRESULT STDMETHODCALLTYPE PresentHook(IDXGISwapChain3* sc, UINT sync, UINT flags) {
@@ -309,7 +342,14 @@ bool GetSwapChainVTable(void*** outVtable, void*** outQueueVtable) {
         D3D12_COMMAND_QUEUE_DESC qd = {};
         qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
         if (FAILED(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue)))) break;
-        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) break;
+        // the factory of the system's dxgi.dll by its path (25.11.: OptiScaler as dxgi.dll in the game folder took
+        // the dummy for a swap chain of the game's, mid-game - with Streamline beside it the game hung at the next
+        // Present; ReShade as dxgi.dll gave its own proxy's Present). Without such a file it is the same dxgi.dll.
+        using CreateFactory1_t = HRESULT(WINAPI*)(REFIID, void**);
+        HMODULE sysDxgi = LoadLibraryExW(L"dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        auto create = sysDxgi ? reinterpret_cast<CreateFactory1_t>(GetProcAddress(sysDxgi, "CreateDXGIFactory1"))
+                              : nullptr;
+        if (!create || FAILED(create(IID_PPV_ARGS(&factory)))) break;
         DXGI_SWAP_CHAIN_DESC1 sd = {};
         sd.Width = 1;
         sd.Height = 1;
@@ -340,6 +380,9 @@ bool GetSwapChainVTable(void*** outVtable, void*** outQueueVtable) {
 }
 
 }  // namespace
+
+int GetBackgroundFps() { return BackgroundFps(); }
+void SetBackgroundFps(int fps) { g_bgFps = fps < 0 ? 0 : fps; }
 
 // Registers a per-present callback. Called every frame from the render thread with the live swap chain.
 void RegisterPresent(TW3SE_PresentCallback callback, void* context) {
@@ -1494,14 +1537,25 @@ bool InstallOverlay(bool needed) {
         told = true;
         return false;
     }
+    // The dummy swap chain at the start, before the game makes its own, the hooks later (25.11.: made mid-game, the
+    // dummy was taken for the game's by OptiScaler - it kept presenting through the released one, and with Streamline
+    // the game hung at the next Present; the same dummy at the start: no trouble). The start's call reads the
+    // vtables only; a later call that needs the hook takes them.
+    static void** vtable = nullptr;
+    static void** queueVtable = nullptr;
+    static bool probed = false;
+    if (!probed) {
+        probed = true;
+        if (!GetSwapChainVTable(&vtable, &queueVtable)) vtable = queueVtable = nullptr;
+    }
     if (!needed && !(mode == "on" || mode == "1" || mode == "true" || mode == "yes")) {
-        Log("overlay: not installed (no plugin draws; `overlay = on` in tw3se.config installs it at start)");
+        Log("overlay: not installed yet (no plugin draws; `overlay = on` in tw3se.config installs it at start)%s",
+            vtable ? "" : " - no dummy swap chain at the start");
         return false;
     }
     installed = true;
-    void** vtable = nullptr;
-    void** queueVtable = nullptr;
-    if (!GetSwapChainVTable(&vtable, &queueVtable) || !vtable) {
+    if (!vtable && !GetSwapChainVTable(&vtable, &queueVtable)) vtable = nullptr;  // (none at the start: now, as before)
+    if (!vtable) {
         Log("overlay: could not create a dummy swap chain - present hook not installed");
         return false;
     }

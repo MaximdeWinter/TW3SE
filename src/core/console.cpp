@@ -140,8 +140,10 @@ std::string PipeFromConfig() {
 
 HANDLE NewInstance(DWORD extraFlags) {
     std::wstring name = L"\\\\.\\pipe\\" + std::wstring(g_pipe.begin(), g_pipe.end());
-    return CreateNamedPipeW(name.c_str(), PIPE_ACCESS_DUPLEX | extraFlags, PIPE_TYPE_BYTE | PIPE_WAIT,
-                            PIPE_UNLIMITED_INSTANCES, 8192, 8192, 0, nullptr);
+    // (PIPE_REJECT_REMOTE_CLIENTS: programs of this PC only - a pipe is reachable over the network otherwise)
+    return CreateNamedPipeW(name.c_str(), PIPE_ACCESS_DUPLEX | extraFlags,
+                            PIPE_TYPE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, PIPE_UNLIMITED_INSTANCES, 8192, 8192,
+                            0, nullptr);
 }
 
 // Several clients at once (the editor polls events while an exec waits for its tick), one thread each. Two

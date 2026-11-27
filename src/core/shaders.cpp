@@ -79,12 +79,18 @@ bool ReadFileBytes(const std::wstring& path, std::vector<uint8_t>& out) {
     return ok && !out.empty();
 }
 
+// The replacements a pipeline creation put in (GfxHook / ComputeHook): a pipeline the device refuses with them drops
+// them for good (25.11.: the skinning shaders with skin_hook = off - every pipeline built twice, a log line each)
+thread_local std::vector<uint64_t> t_swapped;
+std::unordered_set<uint64_t> g_refusedIds;  // (g_mx)
+
 // One shader of a pipeline: counted, dumped once, and swapped when a replacement file exists.
 void Visit(D3D12_SHADER_BYTECODE& bc, const wchar_t* stage) {
     if (!bc.pShaderBytecode || !bc.BytecodeLength) return;
     uint64_t id = Fnv64(bc.pShaderBytecode, bc.BytecodeLength);
     g_shaders.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> l(g_mx);
+    if (g_refusedIds.count(id) || SkinHookKeepsOut(id)) return;
     if (g_dump && g_dumped.insert(id).second)
         WriteFileBytes(g_dumpDir + Hex(id) + L"." + stage + L".cso", bc.pShaderBytecode, bc.BytecodeLength);
     auto mem = g_memReplacements.find(id);  // a plugin's replacement (ShaderReplace) comes first
@@ -92,6 +98,7 @@ void Visit(D3D12_SHADER_BYTECODE& bc, const wchar_t* stage) {
         bc.pShaderBytecode = mem->second.data();
         bc.BytecodeLength = mem->second.size();
         g_replaced.fetch_add(1, std::memory_order_relaxed);
+        t_swapped.push_back(id);
         return;
     }
     auto it = g_replacements.find(id);
@@ -105,6 +112,17 @@ void Visit(D3D12_SHADER_BYTECODE& bc, const wchar_t* stage) {
         bc.pShaderBytecode = it->second.data();
         bc.BytecodeLength = it->second.size();
         g_replaced.fetch_add(1, std::memory_order_relaxed);
+        t_swapped.push_back(id);
+    }
+}
+
+// A pipeline with these replacements was refused: none of them goes into a pipeline again (a plugin's from memory
+// too). Their bytes stay until the end (a pipeline being made on another thread may point at them).
+void DropRefused() {
+    std::lock_guard<std::mutex> l(g_mx);
+    for (uint64_t id : t_swapped) {
+        if (!g_refusedIds.insert(id).second) continue;
+        Log("shaders: %016llx is not used any more (a pipeline with it was refused)", static_cast<unsigned long long>(id));
     }
 }
 
@@ -180,6 +198,11 @@ void NotePso(void* pso, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& d, uint64_t vs
         const D3D12_RENDER_TARGET_BLEND_DESC& t = d.BlendState.RenderTarget[d.BlendState.IndependentBlendEnable ? i : 0];
         snprintf(b, sizeof b, " rt%u=f%d:%s%d/%d:m%x", i, d.RTVFormats[i], t.BlendEnable ? "b" : "-", t.SrcBlend,
                  t.DestBlend, t.RenderTargetWriteMask);
+        s += b;
+    }
+    if (d.DepthStencilState.StencilEnable) {
+        snprintf(b, sizeof b, " stencil=r%02x/w%02x/f%d", d.DepthStencilState.StencilReadMask,
+                 d.DepthStencilState.StencilWriteMask, d.DepthStencilState.FrontFace.StencilFunc);
         s += b;
     }
     if (d.BlendState.AlphaToCoverageEnable) s += " a2c";
@@ -406,6 +429,7 @@ HRESULT STDMETHODCALLTYPE GfxHook(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELI
                        desc->VS.BytecodeLength);
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = *desc;
     uint64_t before = g_replaced.load();
+    t_swapped.clear();
     Visit(d.VS, L"vs");
     Visit(d.PS, L"ps");
     Visit(d.DS, L"ds");
@@ -419,6 +443,7 @@ HRESULT STDMETHODCALLTYPE GfxHook(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELI
     HRESULT hr = oGfx(dev, &d, riid, out);
     if (FAILED(hr) && (g_replaced.load() != before || blended)) {  // a replacement the device refused: the game's own
         Log("shaders: a pipeline with a replaced shader or blend was refused (0x%08lx) - it keeps the game's", hr);
+        DropRefused();
         hr = oGfx(dev, desc, riid, out);
         blended = 0;
     }
@@ -432,6 +457,7 @@ HRESULT STDMETHODCALLTYPE GfxHook(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELI
         info.hs = IdOf(desc->HS);
         info.gs = IdOf(desc->GS);
         TellPipeline(info, desc->pRootSignature);
+        HighlightNotePipeline(dev, *desc, info.ps);
     }
     return hr;
 }
@@ -442,10 +468,12 @@ HRESULT STDMETHODCALLTYPE ComputeHook(ID3D12Device* dev, const D3D12_COMPUTE_PIP
     NoteCompute(*desc);
     D3D12_COMPUTE_PIPELINE_STATE_DESC d = *desc;
     uint64_t before = g_replaced.load();
+    t_swapped.clear();
     Visit(d.CS, L"cs");
     HRESULT hr = oCompute(dev, &d, riid, out);
     if (FAILED(hr) && g_replaced.load() != before) {
         Log("shaders: a compute pipeline with a replaced shader was refused (0x%08lx) - it keeps the game's", hr);
+        DropRefused();
         hr = oCompute(dev, desc, riid, out);
     }
     if (SUCCEEDED(hr) && out && *out) {

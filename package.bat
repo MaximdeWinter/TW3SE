@@ -32,6 +32,9 @@ xcopy /e /i /y lua\tests "%GAME%\bin\x64_dx12\tw3se\lua\tests" >nul
 rem the w3.* types for the editor: a mod folder in Mods\<modName>\tw3se finds them at ..\..\..\bin\x64_dx12\tw3se\lua\types
 mkdir "%GAME%\bin\x64_dx12\tw3se\lua\types" 2>nul
 copy /y lua\types\w3api.lua "%GAME%\bin\x64_dx12\tw3se\lua\types\w3api.lua" >nul
+rem the game's outline shader with a channel for w3.highlight's colour of its own (tools/focus_patch.py)
+mkdir "%GAME%\bin\x64_dx12\tw3se\shaders" 2>nul
+copy /y shaders\ec02b0473a2af8a4.cso "%GAME%\bin\x64_dx12\tw3se\shaders\ec02b0473a2af8a4.cso" >nul || exit /b 1
 
 rem --- SDK for plugin authors: headers + examples + the pipe tool + the manual ---
 mkdir "%SDK%\include\tw3se" 2>nul

@@ -162,6 +162,7 @@ void StartUp() {
     InstallGameGuard();  // first: the game's crash handler must not see the faults TW3SE's guards take
     InstallDiagnostics();
     InstallHwWatch();
+    InstallEnvironLog();  // graphics cards and the other tools in the game, in the log at the first tick
     if (!InstallMainThread()) {
         Log("main thread hook failed - TW3SE stays passive");
         return;
@@ -183,6 +184,7 @@ void StartUp() {
     InstallLifecycle();  // OnGameLoaded event (game start / save load)
     InstallWorldEdit();  // entity-attach hook (world-edit persistence foundation)
     InstallSectorEdit();  // the merged geometry of the world (buildings): for now the Umbra switch
+    InstallHighlight();  // two outline colours of its own in the Witcher senses (the focus effect's quads)
     InstallFoliage();  // trees of the foliage: measurement natives
     InstallQuestLive();  // quest blocks activated, for the editor's graph (off until asked for)
     InstallPoseHook();  // per-frame pose combine hook for live bone control (off unless config posehook=diag|on)

@@ -96,6 +96,7 @@ def main():
         z.write(os.path.join(game, "CHANGELOG.md"), r"bin\x64_dx12\tw3se\CHANGELOG.md")
         add_tree(z, os.path.join(game, "docs"), r"bin\x64_dx12\tw3se\docs")
         add_tree(z, os.path.join(game, "bin", "x64_dx12", "tw3se", "lua"), r"bin\x64_dx12\tw3se\lua")   # library, examples, tests
+        add_tree(z, os.path.join(game, "bin", "x64_dx12", "tw3se", "shaders"), r"bin\x64_dx12\tw3se\shaders")   # w3.highlight's colour
         z.write(NOTICES, r"bin\x64_dx12\tw3se\THIRD_PARTY_NOTICES.txt")
         fomod(z, v)
     seal(player)

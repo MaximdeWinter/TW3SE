@@ -1851,25 +1851,32 @@ template <class F> void ForEachMapEntry(const void* m, F f) {  // f(key*, value*
 using MapFind_t = void* (*)(void* type, void* map, const void* key);
 using MapInsert_t = bool (*)(void* type, void* map, const void* key, void** value);
 using MapDelete_t = bool (*)(void* type, void* map, const void* key);
+// (the slots are 5.01's; RttiSlot gives them in this build: 5.02 has one more from slot 10 on)
 void* MapFindG(void* t, void* m, const void* k) {
+    int s = RttiSlot(t, 30);
+    if (s < 0) return nullptr;
     __try {
-        return (*reinterpret_cast<MapFind_t**>(t))[30](t, m, k);
+        return (*reinterpret_cast<MapFind_t**>(t))[s](t, m, k);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return nullptr;
     }
 }
 void* MapInsertG(void* t, void* m, const void* k) {  // the value's address (new or existing), null on a fault
+    int s = RttiSlot(t, 34);
+    if (s < 0) return nullptr;
     __try {
         void* v = nullptr;
-        (*reinterpret_cast<MapInsert_t**>(t))[34](t, m, k, &v);
+        (*reinterpret_cast<MapInsert_t**>(t))[s](t, m, k, &v);
         return v;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return nullptr;
     }
 }
 bool MapDeleteG(void* t, void* m, const void* k) {
+    int s = RttiSlot(t, 36);
+    if (s < 0) return false;
     __try {
-        return (*reinterpret_cast<MapDelete_t**>(t))[36](t, m, k);
+        return (*reinterpret_cast<MapDelete_t**>(t))[s](t, m, k);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
@@ -3047,6 +3054,58 @@ int LMemFree(lua_State* L) {
 }
 
 // w3.engine_addr(name) -> the function's offset in witcher3.exe, or nil and why (names as w3.engine_hook takes them)
+// w3.find_code(signature [, max]) -> {address, ...}: every match in witcher3.exe's code (at most max, 16)
+int LFindCode(lua_State* L) {
+    std::vector<uintptr_t> hits = SignatureScan(luaL_checkstring(L, 1), static_cast<size_t>(luaL_optinteger(L, 2, 16)));
+    lua_createtable(L, static_cast<int>(hits.size()), 0);
+    for (size_t i = 0; i < hits.size(); ++i) {
+        lua_pushinteger(L, static_cast<lua_Integer>(hits[i]));
+        lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
+    }
+    return 1;
+}
+// w3.patch(place, bytes [, offset]) -> id, or nil and why. place: an address (below 0x10000000 an offset in
+// witcher3.exe), an engine name or a signature that matches once; bytes: hex text ("90 90 C3") or {0x90, ...}
+int LPatch(lua_State* L) {
+    std::string err, name;
+    uintptr_t at = 0;
+    if (lua_type(L, 1) == LUA_TSTRING) {
+        name = lua_tostring(L, 1);
+        at = PatchPlace(&name, 0, &err);
+    } else {
+        at = PatchPlace(nullptr, static_cast<uintptr_t>(luaL_checkinteger(L, 1)), &err);
+    }
+    std::vector<uint8_t> bytes;
+    if (lua_istable(L, 2)) {
+        for (lua_Integer i = 1, n = static_cast<lua_Integer>(lua_rawlen(L, 2)); i <= n; ++i) {
+            lua_rawgeti(L, 2, i);
+            bytes.push_back(static_cast<uint8_t>(luaL_checkinteger(L, -1)));
+            lua_pop(L, 1);
+        }
+    } else {
+        const char* s = luaL_checkstring(L, 2);
+        for (const char* p = s; *p;) {
+            if (*p == ' ') { ++p; continue; }
+            if (!isxdigit(static_cast<unsigned char>(p[0])) || !isxdigit(static_cast<unsigned char>(p[1])))
+                return luaL_argerror(L, 2, "hex pairs like \"90 90 C3\", or a table of numbers");
+            bytes.push_back(static_cast<uint8_t>(strtoul(std::string(p, 2).c_str(), nullptr, 16)));
+            p += 2;
+        }
+    }
+    int id = 0;
+    if (at) id = PatchBytes(at + static_cast<uintptr_t>(luaL_optinteger(L, 3, 0)), bytes, g_curMod, &err);
+    if (!id) {
+        lua_pushnil(L);
+        lua_pushstring(L, err.c_str());
+        return 2;
+    }
+    lua_pushinteger(L, id);
+    return 1;
+}
+int LUnpatch(lua_State* L) {  // w3.unpatch(id): the old bytes back
+    lua_pushboolean(L, PatchRestore(static_cast<int>(luaL_checkinteger(L, 1))));
+    return 1;
+}
 int LEngineAddr(lua_State* L) {
     std::string why;
     uintptr_t a = EngineResolve(luaL_checkstring(L, 1), &why);
@@ -4390,6 +4449,42 @@ int LBlendUnload(lua_State* L) {
     lua_pushboolean(L, BlendUnload(static_cast<int>(luaL_checkinteger(L, 1))));
     return 1;
 }
+int LHideOpen(lua_State* L) {  // w3._hide_open(render mesh) -> hide id | nil, error
+    std::string err;
+    int id = HideOpen(static_cast<uintptr_t>(luaL_checkinteger(L, 1)), &err);
+    if (!id) {
+        lua_pushnil(L);
+        lua_pushstring(L, err.c_str());
+        return 2;
+    }
+    lua_pushinteger(L, id);
+    return 1;
+}
+int LHideBits(lua_State* L) {  // w3._hide_bits(hide, chunk from 0, bit field string) -> true | nil, error
+    size_t n = 0;
+    const char* b = luaL_checklstring(L, 3, &n);
+    std::string err;
+    if (!HideBits(static_cast<int>(luaL_checkinteger(L, 1)), static_cast<uint32_t>(luaL_checkinteger(L, 2)),
+                  reinterpret_cast<const uint8_t*>(b), n, &err)) {
+        lua_pushnil(L);
+        lua_pushstring(L, err.c_str());
+        return 2;
+    }
+    lua_pushboolean(L, 1);
+    return 1;
+}
+int LHideClose(lua_State* L) {
+    lua_pushboolean(L, HideClose(static_cast<int>(luaL_checkinteger(L, 1))));
+    return 1;
+}
+int LHideState(lua_State* L) {
+    lua_pushstring(L, HideState(static_cast<int>(luaL_checkinteger(L, 1))).c_str());
+    return 1;
+}
+int LHideForget(lua_State* L) {
+    lua_pushinteger(L, HideForget(static_cast<uintptr_t>(luaL_checkinteger(L, 1))));
+    return 1;
+}
 // The skinning shader hook (skinhook.cpp): w3.skinhook in lua_lib.inc wraps these.
 int LSkinAdd(lua_State* L) {  // w3._skin_add(render mesh) -> slot | nil, error
     std::string err;
@@ -4881,16 +4976,16 @@ int LSectorList(lua_State* L) {  // w3._sector(sector address) -> {{type, flags,
     }
     return 1;
 }
-// w3._sector_meshes(sector address [, x, y, z, radius]) -> {{index (from 1), resource, hash (16 hex digits),
-// m = {12}, box = {6}, min = {3}, max = {3}, collision}, ...} or nil: sector.cpp, SectorMeshes
+// w3._sector_meshes(sector address [, x, y, z, radius | index from 1]) -> {{index (from 1), resource, hash (16 hex
+// digits), m = {12}, box = {6}, min = {3}, max = {3}, collision}, ...} or nil: sector.cpp, SectorMeshes
 int LSectorMeshes(lua_State* L) {
     std::vector<SectorMesh> ms;
     float c[3] = {};
-    bool around = !lua_isnoneornil(L, 2);
+    bool one = lua_gettop(L) == 2, around = !one && !lua_isnoneornil(L, 2);
     if (around) c[0] = static_cast<float>(luaL_checknumber(L, 2)), c[1] = static_cast<float>(luaL_checknumber(L, 3)),
               c[2] = static_cast<float>(luaL_checknumber(L, 4));
     if (SectorMeshes(reinterpret_cast<void*>(static_cast<uintptr_t>(luaL_checkinteger(L, 1))), &ms, around ? c : nullptr,
-                     around ? static_cast<float>(luaL_checknumber(L, 5)) : 0) < 0)
+                     around ? static_cast<float>(luaL_checknumber(L, 5)) : 0, one ? luaL_checkinteger(L, 2) - 1 : -1) < 0)
         return 0;
     lua_createtable(L, static_cast<int>(ms.size()), 0);
     for (size_t i = 0; i < ms.size(); ++i) {
@@ -4951,6 +5046,99 @@ int LSectorSetPos(lua_State* L) {  // w3._sector_pos(sector address, index from 
     lua_pushboolean(L, SectorSetPos(reinterpret_cast<void*>(static_cast<uintptr_t>(luaL_checkinteger(L, 1))),
                                     static_cast<uint32_t>(luaL_checkinteger(L, 2) - 1), p));
     return 1;
+}
+// w3._sector_proxies(world, {index from 1, ...}) -> {[index] = render proxy address} of the objects of the world's
+// block that are streamed in, or nil: sector.cpp, SectorProxies
+int LSectorProxies(lua_State* L) {
+    void* world = CheckLive(L, 1)->ptr;
+    luaL_checktype(L, 2, LUA_TTABLE);
+    std::vector<uint32_t> ids;
+    for (lua_Integer i = 1;; ++i) {
+        if (lua_rawgeti(L, 2, i) == LUA_TNIL) { lua_pop(L, 1); break; }
+        ids.push_back(static_cast<uint32_t>(luaL_checkinteger(L, -1) - 1));
+        lua_pop(L, 1);
+    }
+    std::vector<void*> px(ids.size());
+    if (SectorProxies(world, ids.data(), ids.size(), px.data()) < 0) return 0;
+    lua_createtable(L, 0, static_cast<int>(ids.size()));
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (!px[i]) continue;
+        lua_pushinteger(L, static_cast<lua_Integer>(reinterpret_cast<uintptr_t>(px[i])));
+        lua_rawseti(L, -2, static_cast<lua_Integer>(ids[i]) + 1);
+    }
+    return 1;
+}
+// w3._sector_unstream(world, index from 1 [, on]): the world block's object (with its collision) out of the world at
+// once and kept out (on false) or back (on true) -> objects switched, or nil (no streamer); without `on`: is it
+// switched off (true/false): sector.cpp, SectorUnstream
+int LSectorUnstream(lua_State* L) {
+    void* world = CheckLive(L, 1)->ptr;
+    lua_Integer i = luaL_checkinteger(L, 2);
+    if (i < 1 || i > 0x7fffffff) return luaL_argerror(L, 2, "an index from 1");
+    const uint32_t id = static_cast<uint32_t>(i - 1);
+    if (lua_isnoneornil(L, 3)) {
+        int r = SectorUnstreamed(world, id);
+        if (r < 0) return 0;
+        lua_pushboolean(L, r);
+        return 1;
+    }
+    int n = SectorUnstream(world, id, lua_toboolean(L, 3) != 0);
+    if (n < 0) return 0;
+    lua_pushinteger(L, n);
+    return 1;
+}
+// w3._proxy_lc(render proxy address, set bits, clear bits) -> the light channel byte before, or nil (not a render
+// proxy): highlight.cpp, ProxyChannels
+int LProxyLc(lua_State* L) {
+    uint8_t before = 0;
+    if (!ProxyChannels(reinterpret_cast<void*>(static_cast<uintptr_t>(luaL_checkinteger(L, 1))),
+                       static_cast<uint8_t>(luaL_checkinteger(L, 2)), static_cast<uint8_t>(luaL_checkinteger(L, 3)), &before))
+        return 0;
+    lua_pushinteger(L, before);
+    return 1;
+}
+// w3._focus_extra(slot 0 | 1 [, r, g, b, a [, stencil bit]]) -> the stencil bit of the slot's objects, nil when the
+// extra colours are not there. Without a colour the slot goes off: highlight.cpp, FocusExtraColor
+int LFocusExtra(lua_State* L) {
+    float c[4];
+    bool on = !lua_isnoneornil(L, 2);
+    for (int k = 0; on && k < 4; ++k) c[k] = static_cast<float>(luaL_checknumber(L, 2 + k));
+    uint8_t bit = FocusExtraColor(static_cast<int>(luaL_checkinteger(L, 1)), on ? c : nullptr,
+                                  static_cast<uint8_t>(luaL_optinteger(L, 6, 0)));
+    if (!bit) return 0;
+    lua_pushinteger(L, bit);
+    return 1;
+}
+// w3._focus_probe() -> the pipelines the focus effect's quads set at the last probe; asks for the next one
+int LFocusProbe(lua_State* L) {
+    std::string s = FocusProbe();
+    lua_pushlstring(L, s.data(), s.size());
+    return 1;
+}
+// w3._focus_census([on]) -> {all = samples, [0x01] = samples ... [0x80]}, frames counted: highlight.cpp, FocusCensus
+int LFocusCensus(lua_State* L) {
+    int on = lua_isnoneornil(L, 1) ? -1 : lua_toboolean(L, 1) ? 1 : 0;
+    uint64_t c[9];
+    uint64_t frames = FocusCensus(on, c);
+    lua_createtable(L, 0, 9);
+    for (int k = 0; k < 8; ++k) {
+        lua_pushinteger(L, static_cast<lua_Integer>(c[k]));
+        lua_rawseti(L, -2, lua_Integer{1} << k);
+    }
+    lua_pushinteger(L, static_cast<lua_Integer>(c[8]));
+    lua_setfield(L, -2, "all");
+    lua_pushinteger(L, static_cast<lua_Integer>(frames));
+    return 2;
+}
+// w3._focus_color(group 0..3 [, r, g, b, a]) -> r, g, b, a (premultiplied) or nil: highlight.cpp, FocusGroupColor
+int LFocusColor(lua_State* L) {
+    int g = static_cast<int>(luaL_checkinteger(L, 1));
+    float c[4], set[4];
+    bool setting = !lua_isnoneornil(L, 2);
+    for (int k = 0; setting && k < 4; ++k) set[k] = static_cast<float>(luaL_checknumber(L, 2 + k));
+    if (!FocusGroupColor(g, c, setting ? set : nullptr)) return 0;
+    for (float v : c) lua_pushnumber(L, v);
+    return 4;
 }
 
 int LTerrainProbe(lua_State* L) {  // w3._terrain_probe(clipmap address, x, y [, spacing]) -> height, raw value
@@ -5670,6 +5858,18 @@ int LAnimBones(lua_State* L) {  // w3._anim_bones(component) -> {names in rig or
     }
     return 1;
 }
+// w3._anim_reach(component, hand "l" | "r" | nil, x, y, z, weight, ahead, out) -> true (posehook.cpp, AnimReachSet)
+int LAnimReach(lua_State* L) {
+    Obj* o = CheckLive(L, 1);
+    const char* hand = luaL_optstring(L, 2, "");
+    float t[3] = {static_cast<float>(luaL_optnumber(L, 3, 0)), static_cast<float>(luaL_optnumber(L, 4, 0)),
+                  static_cast<float>(luaL_optnumber(L, 5, 0))};
+    std::string err = AnimReachSet(o->ptr, hand[0], t, static_cast<float>(luaL_optnumber(L, 6, 0)),
+                                   static_cast<float>(luaL_optnumber(L, 7, 0.10)), static_cast<float>(luaL_optnumber(L, 8, 0.05)));
+    if (!err.empty()) return luaL_error(L, "w3.anim.reach: %s", err.c_str());
+    lua_pushboolean(L, 1);
+    return 1;
+}
 int LAnimShape(lua_State* L) {
     Obj* o = CheckLive(L, 1);
     luaL_checktype(L, 2, LUA_TTABLE);
@@ -6080,6 +6280,11 @@ int LMessageTake(lua_State* L) {  // w3._message_take() -> {{channel, text}, ...
 }
 int LTw3seConfig(lua_State* L) {  // w3._tw3se_config(key, default): a value from tw3se.config
     lua_pushstring(L, ConfigGet(luaL_checkstring(L, 1), luaL_optstring(L, 2, "")).c_str());
+    return 1;
+}
+int LBackgroundFps(lua_State* L) {  // w3.background_fps([fps]) -> the frame cap behind another window (0: none)
+    if (!lua_isnoneornil(L, 1)) SetBackgroundFps(static_cast<int>(luaL_checkinteger(L, 1)));
+    lua_pushinteger(L, GetBackgroundFps());
     return 1;
 }
 int LMessageSend(lua_State* L) {  // w3._message_send(channel, text)
@@ -6934,10 +7139,10 @@ lua_State* State() {
     lua_pop(L, 1);
     const luaL_Reg w3[] = {{"global", &LGlobal}, {"player", &LPlayer}, {"call", &LCall}, {"enum", &LEnum},
                            {"class", &LClass}, {"fields", &LFields}, {"classof", &LClassOf}, {"find", &LFind},
-                           {"on_tick", &LOnTick}, {"off_tick", &LOffTick}, {"_message_take", &LMessageTake}, {"_message_send", &LMessageSend}, {"_tw3se_config", &LTw3seConfig}, {"time", &LTime}, {"_mod", &LCurMod}, {"_mods", &LModsList}, {"use", &LUse}, {"_plugins", &LPluginsList}, {"_var_get", &LVarGet}, {"_var_set", &LVarSet}, {"_list", &LListDir}, {"_tw3se", &LTw3seInfo}, {"_menu_key", &LMenuKey}, {"_key_capture", &LKeyCapture}, {"off_draw", &LOffDraw}, {"valid", &LValid}, {"on_draw", &LOnDraw},
+                           {"on_tick", &LOnTick}, {"off_tick", &LOffTick}, {"_message_take", &LMessageTake}, {"_message_send", &LMessageSend}, {"_tw3se_config", &LTw3seConfig}, {"background_fps", &LBackgroundFps}, {"time", &LTime}, {"_mod", &LCurMod}, {"_mods", &LModsList}, {"use", &LUse}, {"_plugins", &LPluginsList}, {"_var_get", &LVarGet}, {"_var_set", &LVarSet}, {"_list", &LListDir}, {"_tw3se", &LTw3seInfo}, {"_menu_key", &LMenuKey}, {"_key_capture", &LKeyCapture}, {"off_draw", &LOffDraw}, {"valid", &LValid}, {"on_draw", &LOnDraw},
                            {"screen_size", &LScreenSize}, {"entities", &LEntities},
                            {"by_guid", &LByGuid}, {"guid", &LGuid},
-                           {"addr", &LAddr}, {"peek", &LPeek}, {"_type", &LTypeAddr}, {"_cname", &LCNameText}, {"hwwatch", &LHwWatch}, {"rva", &LRva}, {"poke", &LPoke}, {"_fault", &LFault}, {"declare", &LDeclare}, {"discard", &LDiscard}, {"engine_hook", &LEngineHook}, {"engine_unhook", &LEngineUnhook}, {"engine_hooks", &LEngineHooks}, {"engine_call", &LEngineCall}, {"_mem_alloc", &LMemAlloc}, {"_mem_read", &LMemRead}, {"_mem_write", &LMemWrite}, {"_mem_free", &LMemFree}, {"engine_addr", &LEngineAddr}, {"_scene_stop", &LSceneStop}, {"watch_latent", &LWatchLatent}, {"unwatch_latent", &LUnwatchLatent}, {"new_enum", &LNewEnum}, {"_anim_add_set", &LAnimAddSet}, {"_anim_remove_set", &LAnimRemoveSet}, {"script_stack", &LScriptStack}, {"vhook", &LVHook}, {"vunhook", &LVUnhook},
+                           {"addr", &LAddr}, {"peek", &LPeek}, {"_type", &LTypeAddr}, {"_cname", &LCNameText}, {"hwwatch", &LHwWatch}, {"rva", &LRva}, {"poke", &LPoke}, {"_fault", &LFault}, {"declare", &LDeclare}, {"discard", &LDiscard}, {"engine_hook", &LEngineHook}, {"engine_unhook", &LEngineUnhook}, {"engine_hooks", &LEngineHooks}, {"engine_call", &LEngineCall}, {"_mem_alloc", &LMemAlloc}, {"_mem_read", &LMemRead}, {"_mem_write", &LMemWrite}, {"_mem_free", &LMemFree}, {"engine_addr", &LEngineAddr}, {"find_code", &LFindCode}, {"patch", &LPatch}, {"unpatch", &LUnpatch}, {"_scene_stop", &LSceneStop}, {"watch_latent", &LWatchLatent}, {"unwatch_latent", &LUnwatchLatent}, {"new_enum", &LNewEnum}, {"_anim_add_set", &LAnimAddSet}, {"_anim_remove_set", &LAnimRemoveSet}, {"script_stack", &LScriptStack}, {"vhook", &LVHook}, {"vunhook", &LVUnhook},
                            {"vslot", &LVSlot}, {"object", &LObjectAt}, {"on_line", &LOnLine}, {"off_line", &LOffLine}, {"dir", &LDir},
                            {"_mat_params", &LMatParams}, {"_mat_set", &LMatSet},
                            {"_files_reload", &LFilesReload}, {"_files_set", &LFilesSet}, {"_files_clear", &LFilesClear}, {"_diskfile", &LDiskFile},
@@ -6947,12 +7152,12 @@ lua_State* State() {
                            {"_dbg_recv", &LDbgRecv}, {"_dbg_send", &LDbgSend}, {"_dbg_connected", &LDbgConnected},
                            {"_dbg_alive", &LDbgAlive}, {"_typename", &LTypeName}, {"_px_scene", &LPxScene},
                            {"_px_gravity", &LPxGravity}, {"_config", &LConfig}, {"_config_list", &LConfigList},
-                           {"_sector", &LSectorList}, {"_sector_meshes", &LSectorMeshes}, {"_sector_world", &LSectorWorld}, {"_mesh_path", &LMeshPath}, {"_sector_pos", &LSectorSetPos},
-                           {"_terrain_overlay", &LTerrainOverlay}, {"_terrain_probe", &LTerrainProbe}, {"_rest_bones", &LRestBones}, {"_terrain_raise", &LTerrainRaise}, {"_scene_time", &LSceneTime}, {"_anim_sample", &LAnimSample}, {"_view_rect", &LViewRect}, {"_anim_pose", &LAnimPose}, {"_anim_create", &LAnimCreate}, {"_anim_publish", &LAnimPublish}, {"_anim_record", &LAnimRecord}, {"_anim_shape", &LAnimShape}, {"_anim_bones", &LAnimBones}, {"_anim_record_stop", &LAnimRecordStop}, {"_scene_pause", &LScenePause}, {"_scene_elements", &LSceneElements}, {"_scene_seek", &LSceneSeek}, {"_decal_spawn", &LDecalSpawn}, {"_decal_remove", &LDecalRemove}, {"_decal_clear", &LDecalClear}, {"_decal_count", &LDecalCount}, {"_decal_per_mesh", &LDecalPerMesh}, {"_decal_color", &LDecalColor}, {"_net_http", &LNetHttp}, {"_net_connect", &LNetConnect},
+                           {"_sector", &LSectorList}, {"_sector_meshes", &LSectorMeshes}, {"_sector_world", &LSectorWorld}, {"_mesh_path", &LMeshPath}, {"_sector_pos", &LSectorSetPos}, {"_sector_proxies", &LSectorProxies}, {"_sector_unstream", &LSectorUnstream}, {"_proxy_lc", &LProxyLc}, {"_focus_color", &LFocusColor}, {"_focus_extra", &LFocusExtra}, {"_focus_probe", &LFocusProbe}, {"_focus_census", &LFocusCensus},
+                           {"_terrain_overlay", &LTerrainOverlay}, {"_terrain_probe", &LTerrainProbe}, {"_rest_bones", &LRestBones}, {"_terrain_raise", &LTerrainRaise}, {"_scene_time", &LSceneTime}, {"_anim_sample", &LAnimSample}, {"_view_rect", &LViewRect}, {"_anim_pose", &LAnimPose}, {"_anim_create", &LAnimCreate}, {"_anim_publish", &LAnimPublish}, {"_anim_record", &LAnimRecord}, {"_anim_shape", &LAnimShape}, {"_anim_reach", &LAnimReach}, {"_anim_bones", &LAnimBones}, {"_anim_record_stop", &LAnimRecordStop}, {"_scene_pause", &LScenePause}, {"_scene_elements", &LSceneElements}, {"_scene_seek", &LSceneSeek}, {"_decal_spawn", &LDecalSpawn}, {"_decal_remove", &LDecalRemove}, {"_decal_clear", &LDecalClear}, {"_decal_count", &LDecalCount}, {"_decal_per_mesh", &LDecalPerMesh}, {"_decal_color", &LDecalColor}, {"_net_http", &LNetHttp}, {"_net_connect", &LNetConnect},
                            {"_net_udp", &LNetUdp}, {"_net_send", &LNetSend}, {"_net_close", &LNetClose}, {"_net_poll", &LNetPoll},
                            {"report", &LReport},
                            {"_deform_probe", &LDeformProbe}, {"_deform_stats", &LDeformStats}, {"_memfind", &LMemFind}, {"_bs_load", &LBlendLoad}, {"_bs_set", &LBlendSet},
-                           {"_bs_names", &LBlendNames}, {"_bs_state", &LBlendState}, {"_bs_unload", &LBlendUnload},
+                           {"_bs_names", &LBlendNames}, {"_bs_state", &LBlendState}, {"_bs_unload", &LBlendUnload}, {"_hide_open", &LHideOpen}, {"_hide_bits", &LHideBits}, {"_hide_close", &LHideClose}, {"_hide_state", &LHideState}, {"_hide_forget", &LHideForget},
                            {"_bs_dump", &LBlendDump}, {"_bs_stats", &LBlendStats}, {"_shot_burst", &LShotBurst}, {"_bs_forget", &LBlendForget}, {"_bs_reset_all", &LBlendResetAll}, {"_render_rebuild", &LRenderRebuild},
                            {"_lm_new", &LLiveNew}, {"_lm_attach", &LLiveAttach}, {"_lm_fail", &LLiveFail}, {"_lm_close", &LLiveClose},
                            {"_lm_info", &LLiveInfo}, {"_lm_write", &LLiveWrite}, {"_lm_bounds", &LLiveBounds}, {"_tex_probe", &LTexProbe}, {"_tex_test", &LTexTest}, {"_tex_stats", &LTexStats}, {"_tex_readback", &LTexReadback}, {"_bs_index_dump", &LIndexDump}, {"_skin_capture", &LSkinCapture}, {"_skin_mush", &LSkinMush}, {"_skin_dqs", &LSkinDqs}, {"_pso_trace", &LPsoTrace}, {"_skin_mush_mask", &LSkinMushMask}, {"_skin_mush_dump", &LMushDump}, {"_skin_overlay_test", &LSkinOverlayTest}, {"_skin_material_test", &LSkinMaterialTest}, {"_skin_overlay_raw", &LSkinOverlayRaw}, {"_bs_normals", &LBlendNormals}, {"_skin_caps_ex", &LSkinCapsulesEx},
@@ -7497,6 +7702,7 @@ void UnloadMod(lua_State* L, const std::string& key) {
     fns += OffLineOwner(L, key);   // its watched script lines
     fns += FaceClearOwner(key);    // its faces (w3.face) go back to the game
     fns += EngUnhookOwner(L, key);  // its engine hooks (w3.engine_hook)
+    fns += PatchRestoreOwner(key);  // its byte patches (w3.patch)
     fns += LatentUnwatchOwner(L, key);  // its latent watches (w3.watch_latent)
     OwnerTable(L, "hooks");
     int o = lua_gettop(L);

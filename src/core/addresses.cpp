@@ -164,6 +164,20 @@ Pattern Parse(const char* sig) {
     return p;
 }
 
+// A FUNC row's signature, or several separated by " | ": the function as it begins in different builds (patch 5.02
+// changed the first bytes of some). The first is the known build's; the others are tried in order.
+std::vector<Pattern> ParseAlternatives(const char* sig) {
+    std::vector<Pattern> out;
+    std::string all(sig);
+    for (size_t from = 0;;) {
+        size_t bar = all.find('|', from);
+        out.push_back(Parse(all.substr(from, bar == std::string::npos ? std::string::npos : bar - from).c_str()));
+        if (bar == std::string::npos) break;
+        from = bar + 1;
+    }
+    return out;
+}
+
 bool MatchAt(const uint8_t* at, const Pattern& p) {
     for (size_t i = 0; i < p.bytes.size(); ++i)
         if (p.fixed[i] && at[i] != p.bytes[i]) return false;
@@ -294,10 +308,10 @@ int ResolveTables(const FuncRow* funcs, size_t nf, const CallRow* calls, size_t 
     };
     for (size_t i = 0; i < nf; ++i) {
         const FuncRow& f = funcs[i];
-        Pattern p = Parse(f.sig);
+        std::vector<Pattern> alts = ParseAlternatives(f.sig);
         uintptr_t a = 0;
         const uint8_t* at = reinterpret_cast<const uint8_t*>(ImageBase() + f.rva);
-        if (rvaValid && MatchAt(at, p)) {
+        if (rvaValid && MatchAt(at, alts[0])) {
             a = ImageBase() + f.rva;
         } else if (rvaValid && HookedAt(at)) {
             // another mod hooked it before TW3SE (a jump over its first bytes): on the known build the place is
@@ -305,13 +319,15 @@ int ResolveTables(const FuncRow* funcs, size_t nf, const CallRow* calls, size_t 
             a = ImageBase() + f.rva;
             Log("address %s: hooked by another mod before TW3SE - kept, the hooks chain", f.name);
         } else {
-            a = Scan(p);
+            for (size_t k = 0; k < alts.size() && !a; ++k) a = Scan(alts[k]);
             if (a) {
                 Log("address %s: found by signature", f.name);
-            } else if ((a = ScanOnDisk(p)) != 0) {
-                Log("address %s: hooked by another mod before TW3SE - found in witcher3.exe on disk, the hooks chain", f.name);
             } else {
-                Log("address %s: NOT FOUND", f.name);
+                for (size_t k = 0; k < alts.size() && !a; ++k) a = ScanOnDisk(alts[k]);
+                if (a)
+                    Log("address %s: hooked by another mod before TW3SE - found in witcher3.exe on disk, the hooks chain", f.name);
+                else
+                    Log("address %s: NOT FOUND", f.name);
             }
         }
         if (!a && !f.optional) ++missing;  // an optional address may be absent: only its feature stays off
@@ -450,6 +466,24 @@ void ForEachAddress(void (*visit)(const char* name, uintptr_t a, void* ctx), voi
 uint32_t FieldOr(const char* name, uint32_t retail) {
     uintptr_t v = Address(name);
     return v ? static_cast<uint32_t>(v) : retail;
+}
+
+// Every match of a signature ("48 8B ?? 05", ? or ?? for any byte) in witcher3.exe's code, at most `max` of them.
+std::vector<uintptr_t> SignatureScan(const char* sig, size_t max) {
+    std::vector<uintptr_t> out;
+    Pattern p = Parse(sig);
+    const uint8_t* text;
+    size_t size;
+    TextSection(text, size);
+    if (!text || p.bytes.empty() || !p.fixed[0] || size < p.bytes.size()) return out;
+    const uint8_t* end = text + size - p.bytes.size();
+    for (const uint8_t* at = text; at < end && out.size() < max;) {
+        at = static_cast<const uint8_t*>(memchr(at, p.bytes[0], end - at));
+        if (!at) break;
+        if (MatchAt(at, p)) out.push_back(reinterpret_cast<uintptr_t>(at));
+        ++at;
+    }
+    return out;
 }
 
 }  // namespace tw3se

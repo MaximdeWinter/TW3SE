@@ -41,7 +41,7 @@
 
 #define TW3SE_VERSION_MAJOR 1
 #define TW3SE_VERSION_MINOR 4
-#define TW3SE_VERSION_PATCH 2
+#define TW3SE_VERSION_PATCH 3
 
 typedef struct TW3SE_PluginInfo {
     uint32_t infoVersion;      /* set by TW3SE: 1 */

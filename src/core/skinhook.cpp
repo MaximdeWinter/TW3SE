@@ -1,6 +1,8 @@
 // Skinning shader hook (contact zones that push the skin): the game's skinning vertex shaders, patched offline by
 // tools/skin_build.py, read two constant buffers of TW3SE's after the skinned position:
-//   b12, space7: a root constant, the slot of the mesh drawn (0 = none: the shader leaves the vertex as it is)
+//   b12, space7: the slot of the mesh drawn (0 = none: the shader leaves the vertex as it is), a root constant buffer
+//                view (25.11.: root constants made ReShade add-ons like RenoDX leave the game's main signature alone,
+//                they refuse a signature that has some): one 256-byte entry a change, in a ring (SkinHookSlotVa)
 //   b13, space7: a table: rows 0..8 the capsule counts of slot s (x: this frame, y: the frame before), then per slot,
 //                capsule and time three rows (a.xyz + radius, b.xyz + strength, falloff + mode; model space of the
 //                slot's mesh, metres). Out (mode >= 0): a skinned vertex's distance to the capsule's segment becomes
@@ -138,6 +140,14 @@ std::atomic<uint32_t> g_part{0};
 ID3D12Resource* g_wbuf = nullptr;
 float* g_wmap = nullptr;
 uint32_t g_wNext = 1;  // the next free float in t14 (g_mx)
+// b12's values (slot, weights, mush place, mush half): entry 0 the one of every draw without a slot, then a part of
+// the ring per table part; a frame's changes beyond kSlotEntries get entry 0 (the draw is not pushed)
+constexpr uint64_t kSlotEntry = 256;  // a constant buffer view's alignment
+constexpr uint32_t kSlotEntries = 8192;
+ID3D12Resource* g_sbuf = nullptr;
+uint8_t* g_smap = nullptr;
+std::atomic<uint32_t> g_sUsed[kRing] = {};
+std::atomic<bool> g_sFull{false};
 
 ID3D12Resource* UploadBuffer(ID3D12Device* dev, uint64_t size, void** map) {
     D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_UPLOAD};
@@ -167,6 +177,17 @@ void MakeBuffer(ID3D12PipelineState* pso) {
     void* w = nullptr;
     ID3D12Resource* b = UploadBuffer(dev, kPart * kRing, &m);
     ID3D12Resource* wb = b ? UploadBuffer(dev, 4ull * kWeightCapacity, &w) : nullptr;
+    void* sm = nullptr;
+    ID3D12Resource* sb = wb ? UploadBuffer(dev, kSlotEntry * (1 + kRing * kSlotEntries), &sm) : nullptr;
+    if (sb) {
+        const uint32_t none[4] = {0u, ~0u, ~0u, 0u};
+        memcpy(sm, none, sizeof none);
+        g_smap = static_cast<uint8_t*>(sm);
+        g_sbuf = sb;
+    } else if (wb) {
+        wb->Release();
+        wb = nullptr;
+    }
     if (wb) {
         g_wmap = static_cast<float*>(w);
         g_wmap[0] = 1.0f;  // what a chunk without weights reads
@@ -279,6 +300,7 @@ void WriteTable() {
             readBack = true;
         }
     }
+    g_sUsed[part].store(0, std::memory_order_relaxed);  // (its entries were read three frames ago)
     g_part.store(part, std::memory_order_release);
     if (readBack && g_cap) {
         BlendQueueRaw(g_cap, 0, 16ull * done.limit, done.head, done.path);
@@ -290,6 +312,14 @@ void WriteTable() {
 
 void InstallSkinHook() {
     if (!ConfigBool("skin_hook", false)) return;
+    // the patched shaders read b12/b13/t14, bound from the command list hooks, which come through the overlay's
+    // ExecuteCommandLists hook: with the overlay off they would draw with nothing bound (25.11.: on NVIDIA zeros, on
+    // other drivers a fault of the GPU) - then the game keeps its own shaders
+    const std::string ovMode = ConfigGet("overlay", "auto");
+    if (ovMode == "off" || ovMode == "0" || ovMode == "false" || ovMode == "no") {
+        Log("skinhook: skin_hook = on, but overlay = off in tw3se.config: the skinning hook needs the overlay - off");
+        return;
+    }
     std::wstring path = Dir() + L"\\shaders\\skinhook.txt";
     FILE* f = _wfopen(path.c_str(), L"r");
     if (!f) {
@@ -327,12 +357,12 @@ void InstallSkinHook() {
     table.Descriptor.ShaderRegister = 13;
     table.Descriptor.RegisterSpace = 7;
     table.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    D3D12_ROOT_PARAMETER1 slot = {};
-    slot.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    slot.Constants.ShaderRegister = 12;
-    slot.Constants.RegisterSpace = 7;
-    slot.Constants.Num32BitValues = 4;  // the slot, where the chunk's weights start, its place in the mush area,
-                                        // this frame's half of the mush positions
+    D3D12_ROOT_PARAMETER1 slot = {};  // the slot, where the chunk's weights start, its place in the mush area, this
+                                      // frame's half of the mush positions (a view of 16 bytes: no root constants)
+    slot.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    slot.Descriptor.ShaderRegister = 12;
+    slot.Descriptor.RegisterSpace = 7;
+    slot.Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE;
     slot.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     D3D12_ROOT_PARAMETER1 weights = {};
     weights.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
@@ -375,6 +405,26 @@ void InstallSkinHook() {
 }
 
 bool SkinHookOn() { return g_on.load(std::memory_order_relaxed); }
+
+// A shader of tw3se\shaders that is one of skinhook.txt's while the hook is off (skin_hook = off, overlay = off, a
+// layout that does not fit): it reads parameters the game's signature has not got, so it stays out of the pipelines
+// (shaders.cpp; 25.11.: else every such pipeline was refused once and built again with the game's shader)
+bool SkinHookKeepsOut(uint64_t id) {
+    if (SkinHookOn()) return false;
+    static std::once_flag once;
+    static std::unordered_set<uint64_t> listed;
+    std::call_once(once, [] {
+        FILE* f = _wfopen((Dir() + L"\\shaders\\skinhook.txt").c_str(), L"r");
+        if (!f) return;
+        char line[128];
+        while (fgets(line, sizeof line, f)) {
+            uint64_t v = 0;
+            if (line[0] != '#' && sscanf_s(line, "%llx", &v) == 1 && v) listed.insert(v);
+        }
+        fclose(f);
+    });
+    return listed.count(id) != 0;
+}
 
 // A vertex shader the game makes a pipeline with: one that skins (its input signature names BLENDINDICES) and has no
 // patch in skinhook.txt is written to tw3se\shaders\skinhook_missing\<id>.vs.cso and logged once - a figure drawn
@@ -494,6 +544,23 @@ uint64_t SkinHookTableVa() {
     return g_buf ? g_buf->GetGPUVirtualAddress() + g_part.load(std::memory_order_acquire) * kPart : 0;
 }
 uint64_t SkinHookWeightsVa() { return g_wbuf ? g_wbuf->GetGPUVirtualAddress() : 0; }
+// b12's view for a draw's values (render.cpp, when they change): entry 0 for a draw without a slot, else the next
+// entry of this frame's part (0: no buffer yet)
+uint64_t SkinHookSlotVa(const uint32_t v[4]) {
+    if (!g_sbuf) return 0;
+    const uint64_t base = g_sbuf->GetGPUVirtualAddress();
+    if (!v[0] && v[1] == ~0u && v[2] == ~0u) return base;
+    const uint32_t part = g_part.load(std::memory_order_acquire);
+    const uint32_t i = g_sUsed[part].fetch_add(1, std::memory_order_relaxed);
+    if (i >= kSlotEntries) {
+        if (!g_sFull.exchange(true))
+            Log("skinhook: more than %u slot changes in a frame - the rest of them drawn without the push", kSlotEntries);
+        return base;
+    }
+    const uint64_t at = kSlotEntry * (1 + static_cast<uint64_t>(part) * kSlotEntries + i);
+    memcpy(g_smap + at, v, 16);
+    return base + at;
+}
 
 // The ray tracing skinning's signature: where our table and weights go (false for any other signature).
 bool SkinHookComputeIndices(void* rs, int* table, int* weights, int* capture) {

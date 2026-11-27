@@ -528,4 +528,34 @@ void InstallCatalog() {
     RegisterCommand("catalog", &CmdCatalog, "catalog: every registered type and function -> tw3se\\catalog\\rtti.json");
 }
 
+// An IRTTIType vtable slot as 5.01 numbers it, in this build. Patch 5.02 put one more virtual method into
+// IRTTIType at slot 10, so every slot from 10 on is one later there (slot 10 is the construct of a class in 5.01:
+// called as 10 on 5.02 it is an empty stub and the object stays without a vtable). Read once from slot 5 of
+// CClass's own vtable (a native class's type has a vtable of its own, its slot 5 overridden),
+// `mov rax, [rcx]; jmp [rax + X]`: X is 0xb0 in 5.01 and 0xb8 in 5.02. -1 for a slot from 10 on when slot 5 is not
+// that jump (another build): the caller leaves the call out.
+int RttiSlot(void* type, int slot) {
+    static int shift = -2;
+    if (slot < 10) return slot;
+    if (shift == -2) {
+        uint8_t b[10] = {};
+        static const uint8_t head[6] = {0x48, 0x8b, 0x01, 0x48, 0xff, 0xa0};
+        int32_t x = 0;
+        int found = -1;
+        void** table = static_cast<void**>(VtableOfType(".?AVCClass@@"));
+        void* fn = nullptr;
+        if (table && SafeRead(table + 5, &fn, 8) && fn && SafeRead(fn, b, sizeof b) &&
+            memcmp(b, head, sizeof head) == 0) {
+            memcpy(&x, b + 6, 4);
+            if (x == 0xb0 || x == 0xb8) found = (x - 0xb0) / 8;
+        }
+        if (found < 0)
+            Log("rtti: the type's methods are not where they were in 5.01/5.02 - made objects and map access stay off "
+                "(CClass vtable %p, slot 5 %p: %02x %02x %02x %02x %02x %02x %02x %02x)", table, fn, b[0], b[1],
+                b[2], b[3], b[4], b[5], b[6], b[7]);
+        shift = found;
+    }
+    return shift < 0 ? -1 : slot + shift;
+}
+
 }  // namespace tw3se

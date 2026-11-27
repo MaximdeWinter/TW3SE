@@ -196,6 +196,9 @@ start_hang_seconds = 0
 # to while the game loaded keeps them)
 focus_at_start = off
 
+# the graphics cards and the other tools in the game in tw3se.log, at the start (default: on)
+environment_log = off
+
 # the WitcherScript debugger for VS Code (default: off) and its port on this PC (default: 29170)
 debugger = on
 debugger_port = 29170

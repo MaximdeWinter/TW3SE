@@ -231,6 +231,28 @@ float3 Turn(float3 a, float3 b, float3 v) {  // v turned by the rotation that ta
 }
 )";
 
+// Hiding triangles (w3.deform.hide): the triangles of a chunk marked in a bit field are drawn as nothing - their three
+// indices made the same (a triangle without area) in the game's index buffer of the mesh. kHideCS writes the chunk's
+// indices from a copy of the original (orig) and the bits (triangle t: bit t % 8 of byte t / 8) into work, which is
+// copied over the chunk's indices; clearing copies orig back.
+const char kHideCS[] = R"(
+cbuffer C : register(b0) { uint words; uint indices; uint pad0; uint pad1; float4 pad2[4]; };
+ByteAddressBuffer orig : register(t0);
+ByteAddressBuffer bits : register(t1);
+RWByteAddressBuffer work : register(u0);
+uint Index(uint k) { uint w = orig.Load((k * 2) & ~3u); return (k & 1) ? (w >> 16) : (w & 0xffff); }
+uint Out(uint k) {
+    if (k >= indices) return 0;
+    uint t = k / 3;
+    return ((bits.Load((t >> 5) * 4) >> (t & 31)) & 1) ? Index(t * 3) : Index(k);
+}
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= words) return;
+    work.Store(id.x * 4, Out(id.x * 2) | (Out(id.x * 2 + 1) << 16));
+}
+)";
+
 struct Box {
     float s[3], o[3];
 };
@@ -321,6 +343,37 @@ std::mutex g_mx;
 std::map<int, std::unique_ptr<Set>> g_sets;
 std::set<int> g_resetIds;  // sets BlendResetAll ended: "lost" until their owner unloads them
 std::vector<std::unique_ptr<Dump>> g_dumps;
+
+// w3.deform.hide: per render mesh, the chunks whose triangles are hidden (kHideCS)
+struct HideChunk {
+    uint32_t index = 0, icount = 0;
+    uint64_t ioff = 0;          // the chunk's indices in the game's index buffer resource
+    std::vector<uint8_t> bits;  // a bit field waiting to go to the GPU (whole 32-bit words)
+    bool fresh = false;         // `bits` is new
+    bool any = false;           // the bit field hides a triangle (else the original indices go back)
+    ID3D12Resource* orig = nullptr;  // the chunk's original indices
+    ID3D12Resource* work = nullptr;
+    ID3D12Resource* mask = nullptr;  // upload heap: the bit field
+    bool written = false;            // the game's buffer holds indices of ours
+    bool newOrig = false;            // orig was made in the list being recorded (NON_PIXEL_SHADER_RESOURCE)
+};
+struct Hide {
+    int id = 0;
+    uintptr_t rm = 0;
+    uint32_t ibId = 0;
+    ID3D12Resource* ibRes = nullptr;  // the game's index buffer, held while the hide lives
+    uint64_t ibBase = 0;
+    uint32_t ibSize = 0;
+    std::map<uint32_t, HideChunk> chunks;
+    bool ready = false;   // each chunk's original indices are copied
+    bool dirty = false;   // a bit field changed
+    bool unload = false;  // the original indices back, then go
+    bool lost = false;    // the mesh is gone or was loaded anew
+    bool heldRm = false;
+    int watch = -1, waited = 0, sinceSeen = -1;  // as Set: the game's draw of the mesh is awaited
+};
+std::map<int, std::unique_ptr<Hide>> g_hides;
+ID3D12PipelineState* g_hidePso = nullptr;
 int g_nextId = 1;
 
 ID3D12Device* g_dev = nullptr;
@@ -462,6 +515,15 @@ bool InitWriter(ID3D12CommandQueue* q) {
         g_pso = nullptr;
         return false;
     }
+    // hiding triangles (kHideCS, the blend root signature): without it w3.deform.hide reports the failure
+    ID3DBlob* hcs = nullptr;
+    if (SUCCEEDED(compile(kHideCS, sizeof kHideCS - 1, "hide", nullptr, nullptr, "main", "cs_5_0", 0, 0, &hcs, &err))) {
+        pd.CS = {hcs->GetBufferPointer(), hcs->GetBufferSize()};
+        if (FAILED(g_dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_hidePso)))) g_hidePso = nullptr;
+    } else {
+        Log("blendshape: hide shader: %s", err ? static_cast<const char*>(err->GetBufferPointer()) : "?");
+    }
+    if (!g_hidePso) Log("blendshape: hiding triangles is off (its shader failed)");
     // the normals (kNormCS): its own root signature (two UAVs); without it the sets work, DeformNormals stays off
     D3D12_ROOT_PARAMETER np[6] = {};
     np[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
@@ -1032,6 +1094,127 @@ void FinishDump(Dump& d) {
     d.readback->Unmap(0, nullptr);
 }
 
+// The index buffer of a render mesh: its pool id, the resource and where the mesh's indices start in it.
+bool MeshIndices(uintptr_t rm, uint32_t* id, ID3D12Resource** res, uint64_t* base, uint32_t* size) {
+    uint32_t ib = 0;
+    uint64_t dd = 0, va = 0, r = 0, rva = 0, width = 0;
+    if (!SafeRead(reinterpret_cast<void*>(rm + 0xa4), &ib, 4) || !ib || !PoolKnown() ||
+        !SafeRead(reinterpret_cast<void*>(ImageBase() + g_poolPtr), &dd, 8) || !dd)
+        return false;
+    uintptr_t e = dd + (ib - 1ull) * kPoolStride + g_poolEntries;
+    if (!SafeRead(reinterpret_cast<void*>(e), size, 4) || !SafeRead(reinterpret_cast<void*>(e + 0x10), &va, 8) ||
+        !SafeRead(reinterpret_cast<void*>(e + 0x18), &r, 8) || !r || !LooksLikeObject(reinterpret_cast<void*>(r)) ||
+        !ResourceRange(reinterpret_cast<ID3D12Resource*>(r), &rva, &width) || va < rva || va + *size > rva + width)
+        return false;
+    *id = ib;
+    *res = reinterpret_cast<ID3D12Resource*>(r);
+    *base = va - rva;
+    return true;
+}
+
+bool HideStillThere(const Hide& h) {
+    uint32_t id = 0, size = 0;
+    ID3D12Resource* r = nullptr;
+    uint64_t base = 0;
+    return MeshIndices(h.rm, &id, &r, &base, &size) && id == h.ibId && r == h.ibRes && base == h.ibBase;
+}
+
+void FreeHide(Hide& h) {
+    for (auto& e : h.chunks) {
+        Retire(e.second.orig);
+        Retire(e.second.work);
+        Retire(e.second.mask);
+        e.second.orig = e.second.work = e.second.mask = nullptr;
+    }
+    if (h.watch >= 0) DeformWatchEnd(h.watch);
+    h.watch = -1;
+    Retire(h.ibRes);
+    h.ibRes = nullptr;
+    if (h.heldRm) RetireRenderMesh(h.rm);
+    h.heldRm = false;
+}
+
+// Records a hide's work: once the game has drawn the mesh, each chunk's original indices into orig; then each chunk
+// with a new bit field through kHideCS into the game's buffer (or orig back when it hides nothing); unloading writes
+// every chunk's orig back.
+void RecordHide(ID3D12GraphicsCommandList* l, Hide& h) {
+    if (!h.ready) {
+        if (h.watch >= 0) {
+            if (DeformWatchSeen(h.watch) && ++h.sinceSeen >= 2) {
+                DeformWatchEnd(h.watch);
+                h.watch = -1;
+            } else {
+                if (!DeformWatchSeen(h.watch)) ++h.waited;
+                if (h.waited < 300 && DeformDrawHooksLive()) {
+                    if (h.unload) h.lost = true;  // nothing written yet: it ends as it is
+                    return;
+                }
+                DeformWatchEnd(h.watch);
+                h.watch = -1;
+            }
+        }
+    }
+    for (auto& e : h.chunks) {  // the original indices of chunks met for the first time
+        HideChunk& c = e.second;
+        if (c.orig) continue;
+        uint64_t bytes = (2ull * c.icount + 3) & ~3ull;
+        c.orig = MakeBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
+        c.work = MakeBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        if (!c.orig || !c.work) {
+            Log("blendshape: hide %d: GPU buffers failed (chunk %u)", h.id, c.index);
+            h.lost = true;
+            return;
+        }
+        l->CopyBufferRegion(c.orig, 0, h.ibRes, c.ioff, 2ull * c.icount);
+        Barrier(l, c.orig, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        c.newOrig = true;
+    }
+    if (!h.ready) Log("blendshape: hide %d ready (%zu chunks)", h.id, h.chunks.size());
+    h.ready = true;
+    for (auto& e : h.chunks) {
+        HideChunk& c = e.second;
+        if (h.unload || (c.fresh && !c.any)) {  // the original back
+            if (!c.written) { c.fresh = false; continue; }
+            if (c.newOrig) Barrier(l, c.orig, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            l->CopyBufferRegion(h.ibRes, c.ioff, c.orig, 0, 2ull * c.icount);
+            if (c.newOrig) Barrier(l, c.orig, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            c.written = false;
+            c.fresh = false;
+            continue;
+        }
+        if (!c.fresh) continue;
+        ID3D12Resource* mask = MakeBuffer(c.bits.size(), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        void* map = nullptr;
+        if (!mask || FAILED(mask->Map(0, nullptr, &map))) {
+            if (mask) mask->Release();
+            Log("blendshape: hide %d: bit field buffer failed", h.id);
+            continue;
+        }
+        memcpy(map, c.bits.data(), c.bits.size());
+        mask->Unmap(0, nullptr);
+        Retire(c.mask, true);  // the last one may still be read by a list in flight
+        c.mask = mask;
+        uint32_t words = (c.icount + 1) / 2;
+        float k[20] = {};
+        memcpy(&k[0], &words, 4);
+        memcpy(&k[1], &c.icount, 4);
+        l->SetComputeRootSignature(g_root);
+        l->SetPipelineState(g_hidePso);
+        l->SetComputeRoot32BitConstants(0, 20, k, 0);
+        l->SetComputeRootShaderResourceView(1, c.orig->GetGPUVirtualAddress());
+        l->SetComputeRootShaderResourceView(2, c.mask->GetGPUVirtualAddress());
+        l->SetComputeRootShaderResourceView(3, c.orig->GetGPUVirtualAddress());
+        l->SetComputeRootUnorderedAccessView(4, c.work->GetGPUVirtualAddress());
+        l->Dispatch((words + 63) / 64, 1, 1);
+        Barrier(l, c.work, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        l->CopyBufferRegion(h.ibRes, c.ioff, c.work, 0, 2ull * c.icount);
+        c.written = true;
+        c.fresh = false;
+    }
+    for (auto& e : h.chunks) e.second.newOrig = false;  // the next list finds them in COMMON
+}
+
 }  // namespace
 
 int BlendLoad(uintptr_t rm, const std::wstring& path, float range, std::string* err) {
@@ -1207,6 +1390,104 @@ int BlendForget(uintptr_t rm) {
     for (auto& e : g_sets)
         if (e.second->rm == rm) {
             if (e.second->live && !e.second->unload) g_resetIds.insert(e.first);  // "lost" until LiveClose
+            e.second->lost = true;
+            e.second->unload = true;
+            ++n;
+        }
+    return n;
+}
+
+// w3.deform.hide (kHideCS): a hide per render mesh. HideOpen gives the mesh's hide (a new one if it has none).
+int HideOpen(uintptr_t rm, std::string* err) {
+    if (!g_hidePso && g_pso) {
+        *err = "hiding triangles is off (its shader failed, see tw3se.log)";
+        return 0;
+    }
+    {
+        std::lock_guard<std::mutex> l(g_mx);
+        for (auto& e : g_hides)
+            if (e.second->rm == rm && !e.second->unload && !e.second->lost) return e.first;
+    }
+    auto h = std::make_unique<Hide>();
+    if (!MeshIndices(rm, &h->ibId, &h->ibRes, &h->ibBase, &h->ibSize)) {
+        *err = "the mesh's index buffer was not found (is the mesh loaded?)";
+        return 0;
+    }
+    h->rm = rm;
+    h->ibRes->AddRef();
+    uint32_t vbId = 0, vbSize = 0;
+    ID3D12Resource* vb = nullptr;
+    uint64_t vbBase = 0;
+    if (MeshBuffer(rm, &vbId, &vb, &vbBase, &vbSize))
+        h->watch = DeformWatchRange(vb->GetGPUVirtualAddress() + vbBase, vb->GetGPUVirtualAddress() + vbBase + vbSize);
+    h->heldRm = HoldRenderMesh(rm);
+    InstallOverlay(true);
+    std::lock_guard<std::mutex> l(g_mx);
+    h->id = g_nextId++;
+    int id = h->id;
+    Log("blendshape: hide %d opened (render mesh %p)", id, reinterpret_cast<void*>(rm));
+    g_hides[id] = std::move(h);
+    return id;
+}
+
+// A chunk's bit field (triangle t: bit t % 8 of byte t / 8, 1 = hidden); an empty field shows the chunk whole.
+bool HideBits(int id, uint32_t chunk, const uint8_t* bits, size_t n, std::string* err) {
+    std::lock_guard<std::mutex> l(g_mx);
+    auto it = g_hides.find(id);
+    if (it == g_hides.end() || it->second->unload) {
+        *err = "no such hide";
+        return false;
+    }
+    Hide& h = *it->second;
+    uint64_t arr = 0;
+    uint32_t meshChunks = 0, off = 0, icount = 0;
+    if (!SafeRead(reinterpret_cast<void*>(h.rm + 0xa8), &arr, 8) ||
+        !SafeRead(reinterpret_cast<void*>(h.rm + 0xb0), &meshChunks, 4) || chunk >= meshChunks ||
+        !SafeRead(reinterpret_cast<void*>(arr + chunk * kChunkSize + 0x1c), &off, 4) ||
+        !SafeRead(reinterpret_cast<void*>(arr + chunk * kChunkSize + 0x24), &icount, 4) || icount % 3 ||
+        off + 2ull * icount > h.ibSize) {
+        *err = "chunk " + std::to_string(chunk) + " is not in the mesh";
+        return false;
+    }
+    uint32_t tris = icount / 3;
+    if (n > (tris + 7) / 8) {
+        *err = "the bit field is longer than the chunk's " + std::to_string(tris) + " triangles";
+        return false;
+    }
+    HideChunk& c = h.chunks[chunk];
+    c.index = chunk;
+    c.icount = icount;
+    c.ioff = h.ibBase + off;
+    c.bits.assign(((tris + 31) / 32) * 4, 0);
+    if (n) memcpy(c.bits.data(), bits, n);
+    c.any = false;
+    for (uint8_t b : c.bits) c.any = c.any || b;
+    c.fresh = true;
+    h.dirty = true;
+    return true;
+}
+
+bool HideClose(int id) {
+    std::lock_guard<std::mutex> l(g_mx);
+    auto it = g_hides.find(id);
+    if (it == g_hides.end()) return false;
+    it->second->unload = true;
+    return true;
+}
+
+std::string HideState(int id) {
+    std::lock_guard<std::mutex> l(g_mx);
+    auto it = g_hides.find(id);
+    if (it == g_hides.end()) return "none";
+    const Hide& h = *it->second;
+    return h.lost ? "lost" : (h.ready && !h.dirty) ? "ready" : "loading";
+}
+
+int HideForget(uintptr_t rm) {  // the render mesh goes away: its hide ends without writing the indices back
+    std::lock_guard<std::mutex> l(g_mx);
+    int n = 0;
+    for (auto& e : g_hides)
+        if (e.second->rm == rm) {
             e.second->lost = true;
             e.second->unload = true;
             ++n;
@@ -1691,8 +1972,10 @@ struct QueueCount {
     bool usable;  // DIRECT, and not named as a pacer's or a presenter's
     uint64_t lists;
 };
-std::vector<QueueCount> g_queueCounts;  // under g_mx
-ID3D12CommandQueue* g_mainQueue = nullptr;
+// under g_queueMx of their own (the submit hook never takes g_mx: see DeformBeforeSubmit)
+std::mutex g_queueMx;
+std::vector<QueueCount> g_queueCounts;
+std::atomic<ID3D12CommandQueue*> g_mainQueue{nullptr};
 ULONGLONG g_mainPicked = 0;
 
 bool UsableQueue(ID3D12CommandQueue* q) {
@@ -1746,10 +2029,13 @@ std::atomic<bool> g_liveFrame{true};
 // while it draws its outlines, then Streamline, then ours; our list's Reset went into CWSO's Reset hook and waited for
 // that same lock. Inside another mod's submit hook no list of ours is touched any more: the submit hook only counts
 // the queues, the work is recorded and submitted from the Present hook - after the frame's lists, before the next
-// frame's (which is also when a live mesh has to write)
+// frame's (which is also when a live mesh has to write).
+// (24.11., the same freeze once more, thread stacks): the Present hook held g_mx while its list's Reset went into
+// CWSO's Reset hook and waited for CWSO's lock; CWSO, holding it in its submit hook, came on to ours, which waited for
+// g_mx. The submit hook counts the queues under a lock of their own now and never waits for g_mx.
 void DeformBeforeSubmit(void* queue, unsigned lists) {
     if (t_inSubmit) return;
-    std::lock_guard<std::mutex> lock(g_mx);
+    std::lock_guard<std::mutex> lock(g_queueMx);
     IsMainQueue(static_cast<ID3D12CommandQueue*>(queue), lists);
 }
 
@@ -1757,9 +2043,9 @@ void DeformOnPresent() {
     g_liveFrame.store(true, std::memory_order_relaxed);
     if (t_inSubmit) return;
     std::lock_guard<std::mutex> lock(g_mx);
-    ID3D12CommandQueue* queue = g_mainQueue;
+    ID3D12CommandQueue* queue = g_mainQueue.load();
     if (!queue) return;
-    if (g_sets.empty() && g_dumps.empty() && g_retire.empty() && g_retireRm.empty() && !TexWritesPending() &&
+    if (g_sets.empty() && g_hides.empty() && g_dumps.empty() && g_retire.empty() && g_retireRm.empty() && !TexWritesPending() &&
         !MushActive())
         return;
     uint64_t t0 = Micros();
@@ -1859,6 +2145,20 @@ void SubmitWork(ID3D12CommandQueue* q) {
     }
     for (auto& d : g_dumps)
         if (!d->fence) work = true;
+    for (auto it = g_hides.begin(); it != g_hides.end();) {  // w3.deform.hide
+        Hide& h = *it->second;
+        if (!h.lost && !HideStillThere(h)) {
+            h.lost = true;
+            Log("blendshape: hide %d: the mesh is gone or was loaded anew - hide again", h.id);
+        }
+        if (h.lost && h.unload) {
+            FreeHide(h);
+            it = g_hides.erase(it);
+            continue;
+        }
+        if (!h.lost && g_hidePso && (!h.ready || h.dirty || h.unload)) work = true;
+        ++it;
+    }
     if (TexWritesPending()) work = true;  // texwrite.cpp: pixels for a texture
     if (MushActive()) work = true;        // mush.cpp: Delta Mush passes each frame
     if (!work) return;
@@ -1882,6 +2182,12 @@ void SubmitWork(ID3D12CommandQueue* q) {
     }
     for (auto& d : g_dumps)
         if (!d->fence) RecordDump(l, *d);
+    for (auto& e : g_hides) {
+        Hide& h = *e.second;
+        if (h.lost || !g_hidePso || !(!h.ready || h.dirty || h.unload)) continue;
+        RecordHide(l, h);
+        if (h.ready) h.dirty = false;
+    }
     std::vector<IUnknown*> keep;  // texwrite.cpp: the finished writes, their upload buffers and textures
     TexRecord(l, g_dev, &keep);
     MushRecord(l, g_dev, &keep);
@@ -1905,6 +2211,15 @@ void SubmitWork(ID3D12CommandQueue* q) {
             FreeSet(*it->second);
             Log("blendshape: set %d unloaded (original back)", it->second->id);
             it = g_sets.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = g_hides.begin(); it != g_hides.end();) {
+        if (it->second->unload && (it->second->ready || it->second->lost)) {
+            FreeHide(*it->second);
+            Log("blendshape: hide %d ended (indices back)", it->second->id);
+            it = g_hides.erase(it);
         } else {
             ++it;
         }

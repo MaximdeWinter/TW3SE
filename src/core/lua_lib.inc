@@ -520,6 +520,52 @@ function w3.material.own(entity)
   return n
 end
 
+-- Another material into a slot of one mesh component (measured: a wolf with a material of Geralt's armour): the
+-- component gets its own mesh first (w3.deform.own, once), so the other entities with that mesh keep theirs. index
+-- from 1; material: a CMaterialInstance / CMaterialGraph or its depot path (.w2mi, .w2mg). Shows from the next frame.
+local own_state = {}  -- "<entity address>/<component name>" -> {ready, pending = {{index, material}}}
+function w3.material.assign(c, index, material)
+  if type(material) == "string" then
+    material = w3.load(material) or error("w3.material.assign: no material " .. material, 2)
+  end
+  -- (with its own mesh the component gets a new handle: it is found again by its entity and name)
+  local ent, name = c:GetEntity(), c:GetName()
+  local key = string.format("%x/%s", w3.addr(ent), name)
+  local function find()
+    for _, x in ipairs(ent:GetComponentsByClassName("CMeshComponent") or {}) do
+      if x:GetName() == name then return x end
+    end
+  end
+  local function put(i, mat)
+    local x = find()
+    local m = x and x.mesh
+    if not m or i < 1 or i > #m.materials then return false end
+    m.materials[i] = mat
+    return w3._refresh(x)
+  end
+  local st = own_state[key]
+  if st and st.ready then return put(index, material) end
+  if st then
+    st.pending[#st.pending + 1] = {index, material}
+    return true
+  end
+  local ok, err = pcall(w3.deform.own, c)
+  if not ok then return nil, "the component gets no mesh of its own: " .. tostring(err) end
+  st = {ready = false, pending = {{index, material}}}
+  own_state[key] = st
+  w3.run(function()
+    w3.wait_frames(2)
+    w3.wait_until(function()
+      local x = find()
+      return not x or w3.deform.loaded(x)
+    end, 10)
+    st.ready = true
+    for _, p in ipairs(st.pending) do put(p[1], p[2]) end
+    st.pending = {}
+  end)
+  return true
+end
+
 -- A figure's look in parts: the mesh components of the figure and of its mounted items (head, hair, armour, ...).
 -- A skinned part takes another mesh of the same skeleton (the skinning maps its bones anew by name: the gloves'
 -- component with the pants' mesh drew the pants at the legs, measured), and parts go on and off.
@@ -745,17 +791,29 @@ local owned = {}  -- address of the component -> its shared mesh
 local watched, watchTick = {}, nil  -- render mesh address of an own copy with sets -> {component, its address}
 w3.deform._watch = true
 local function watch_copy(c, rm)
-  watched[rm] = {c, w3.addr(c)}
+  local ok, ent = pcall(function() return c:GetEntity() end)
+  watched[rm] = {c, w3.addr(c), ok and ent or nil}
   if watchTick then return end
   watchTick = w3._as("tw3se", w3.on_tick, function()
     if not w3.deform._watch then return end
     for addr, w in pairs(watched) do
       local ok, now, alive = false, nil, w3.valid(w[1])
+      -- (w3.refresh gives the component a new handle while the object stays where it was: found again through its
+      -- entity at the same address, its sets go on - they ended at every refresh, a colour change in the witcher
+      -- woman's editor took the hair cap's shapes, 26.11.)
+      if not alive and w[3] and w3.valid(w[3]) then
+        for _, x in ipairs(w[3]:GetComponentsByClassName("CMeshComponent") or {}) do
+          if w3.addr(x) == w[2] then
+            w[1], alive = x, true
+            break
+          end
+        end
+      end
       if alive then ok, now = pcall(render_mesh, w[1]) end
       if not ok or now ~= addr then
         watched[addr] = nil
         if not alive then owned[w[2]] = nil end  -- a new component at that address gets a copy of its own
-        local n = w3._bs_forget(addr)
+        local n = w3._bs_forget(addr) + w3._hide_forget(addr)
         if n > 0 then print(string.format("w3.deform: %d set(s) ended with a copy whose figure or mesh went", n)) end
       end
     end
@@ -816,6 +874,71 @@ function w3.deform.release(c)  -- the shared mesh back; false if the component h
   return true
 end
 function w3.deform.loaded(c) return (pcall(render_mesh, c)) end
+
+-- Hiding triangles: the triangles of a mesh marked in a bit field per chunk are drawn as nothing (their indices made
+-- the same in the mesh's index buffer). Like a set it changes every entity with that mesh: hide on a copy of the
+-- component's own (w3.deform.own). bits: {[chunk from 0] = string, 1 bit per triangle in index order, bit t % 8 of
+-- byte t / 8; 1 = hidden}; a chunk left out keeps what it had, "" shows it whole. w3.deform.unhide gives all back.
+local hides = {}  -- render mesh address -> hide id
+function w3.deform.hide(c, bits)
+  local rm = render_mesh(c)
+  local id = hides[rm]
+  if not id or w3._hide_state(id) == "none" or w3._hide_state(id) == "lost" then
+    local err
+    id, err = w3._hide_open(rm)
+    if not id then return nil, err end
+    hides[rm] = id
+    if w3.classof(c) ~= "CMesh" and owned[w3.addr(c)] then watch_copy(c, rm) end
+  end
+  for chunk, b in pairs(bits) do
+    local ok, err = w3._hide_bits(id, chunk, b)
+    if not ok then return nil, err end
+  end
+  return id
+end
+function w3.deform.unhide(c)
+  local ok, rm = pcall(render_mesh, c)
+  local id = ok and hides[rm]
+  if not id then return false end
+  hides[rm] = nil
+  return w3._hide_close(id)
+end
+w3.deform.hide_state = w3._hide_state  -- (hide id) -> "loading", "ready", "lost", "none"
+-- The bit fields of a hide file (TWHD, desktop37 M): {mesh name = {[chunk] = string}}
+function w3.deform.hide_file(path)
+  local f = io.open(path:match("^%a:") and path or (w3.fs.folder("tw3se") .. "\\" .. path), "rb")
+  if not f then return nil, "cannot read " .. path end
+  local s = f:read("a")
+  f:close()
+  if s:sub(1, 4) ~= "TWHD" then return nil, "not a TWHD file" end
+  local version, parts, at = string.unpack("<I4I4", s, 5)
+  local out = {}
+  for _ = 1, parts do
+    local name
+    name, at = string.unpack("<s2", s, at)
+    local chunk, tris
+    chunk, tris, at = string.unpack("<I4I4", s, at)
+    local n = (tris + 7) // 8
+    out[name] = out[name] or {}
+    out[name][chunk] = s:sub(at, at + n - 1)
+    at = at + n
+  end
+  return out, version
+end
+-- The union of bit fields (several items over one body part): {[chunk] = string} ... -> {[chunk] = string}
+function w3.deform.hide_union(...)
+  local out = {}
+  for _, t in ipairs({...}) do
+    for chunk, b in pairs(t) do
+      local a = out[chunk] or ""
+      local n = math.max(#a, #b)
+      local r = {}
+      for i = 1, n do r[i] = string.char((a:byte(i) or 0) | (b:byte(i) or 0)) end
+      out[chunk] = table.concat(r)
+    end
+  end
+  return out
+end
 -- fn(count) after TW3SE ended every set because the game rebuilds its render resources (a graphics option applied
 -- through the options, path tracing among them): load the sets again (w3.deform.state gives "none" for the old ones)
 w3.deform._reset_fns = {}
@@ -1458,6 +1581,32 @@ function w3.figure.furs(entity)  -- the entity's fur components (HairWorks has t
   end
   return out
 end
+-- Cloth (APEX, CClothComponent): a figure's own and its mounted items' (the viper armour's tabs are two). Its fields
+-- (windScaler, pressure, ...) are read when the cloth is made; the game's natives act at once.
+w3.cloth = w3.cloth or {}
+function w3.cloth.of(entity)  -- the cloth components of the entity and of its mounted items
+  local out = {}
+  local function scan(e)
+    local cs = e.components
+    for i = 1, cs and #cs or 0 do
+      local c = cs[i]
+      if c and w3.classof(c) == "CClothComponent" then out[#out + 1] = c end
+    end
+  end
+  scan(entity)
+  local inv = entity.GetInventory and entity:GetInventory()
+  for _, id in ipairs(inv and inv:GetAllItems({}) or {}) do
+    if inv:IsItemMounted(id) then
+      local e = inv:GetItemEntityUnsafe(id)
+      if e then scan(e) end
+    end
+  end
+  return out
+end
+function w3.cloth.simulate(c, on) c:SetSimulated(on ~= false) end   -- off: the cloth follows the skeleton only
+function w3.cloth.freeze(c, on) c:SetFrozen(on ~= false) end        -- held where it is
+function w3.cloth.reach(c, scale) c:SetMaxDistanceScale(scale) end  -- how far it may swing from the skin, 0..1
+
 -- A colour texture wins over the colour (the wolves have one), so fur_color takes the texture of the part it sets.
 -- The first change of a resource is kept; fur_reset puts colours and textures back.
 local fur_kept = {}
@@ -2109,6 +2258,7 @@ local function merged_entry(m, source, p)
   local mesh = w3._mesh_path(m.hash)
   local low = mesh and mesh:lower() or ""
   return {source = source, index = m.index, group = m.group, hash = m.hash, mesh = mesh, collision = m.collision,
+          local_box = {min = {X = b[1], Y = b[2], Z = b[3]}, max = {X = b[4], Y = b[5], Z = b[6]}},
           kind = low:find("proxy", 1, true) and "proxy" or low:find("volume", 1, true) and "volume" or "mesh",
           origin = {X = M[10], Y = M[11], Z = M[12]},
           axes = {{X = M[1], Y = M[2], Z = M[3]}, {X = M[4], Y = M[5], Z = M[6]}, {X = M[7], Y = M[8], Z = M[9]}},
@@ -2126,6 +2276,335 @@ function w3.world.merged(pos, radius)
   end
   table.sort(out, function(a, b) return a.distance < b.distance end)
   return out
+end
+)TW3SELIB" R"TW3SELIB(
+-- --- the objects of the world around a point, each with an id that stays the same after a load and while the world
+-- streams: "world:<index>" a merged mesh of the world's block, "<layer path>:<index>" one of a layer's own block,
+-- "entity:<guid>" an entity placed in a layer (CEntity+0x170, the GUID the focus mode keys entities by),
+-- "entity@<address>" one the game or a mod spawned (no GUID; good while it lives). The helpers stay in this block (the
+-- chunk's main function has a limit of 200 locals).
+do
+local function entity_id(e)
+  local a = w3.addr(e)
+  local lo, hi = w3.peek(a, 0x170) or 0, w3.peek(a, 0x178) or 0
+  if lo == 0 and hi == 0 then return string.format("entity@%x", a) end
+  return "entity:" .. string.pack("<I8I8", lo, hi):gsub(".", function(c) return string.format("%02x", c:byte()) end)
+end
+local function drawn(c)  -- a component with a render proxy at +0x158 (CDrawableComponent)
+  local cls = w3.classof(c)
+  return cls:find("Mesh", 1, true) or cls:find("Cloth", 1, true) or cls:find("Fur", 1, true)
+end
+local known_entities = setmetatable({}, {__mode = "v"})  -- id -> entity, from the last lists
+local function entity_object(e, p)
+  local pos = e:GetWorldPosition()
+  local meshes, lo, hi = {}, {1e30, 1e30, 1e30}, {-1e30, -1e30, -1e30}
+  for _, c in ipairs(e.components or {}) do
+    if drawn(c) then
+      local ok, m = pcall(function() return c.mesh end)
+      local path = ok and m and m:GetPath() or nil
+      meshes[#meshes + 1] = {component = c, mesh = path}
+      local okb, bb = pcall(function() return m.boundingBox end)
+      local okm, M = pcall(function() return c:GetLocalToWorld() end)
+      if path and okb and bb and okm and M then
+        for k = 0, 7 do
+          local l = {(k & 1) ~= 0 and bb.Max.X or bb.Min.X, (k & 2) ~= 0 and bb.Max.Y or bb.Min.Y,
+                     (k & 4) ~= 0 and bb.Max.Z or bb.Min.Z}
+          for i, ax in ipairs({"X", "Y", "Z"}) do
+            local w = M.W[ax] + l[1] * M.X[ax] + l[2] * M.Y[ax] + l[3] * M.Z[ax]
+            lo[i], hi[i] = math.min(lo[i], w), math.max(hi[i], w)
+          end
+        end
+      end
+    end
+  end
+  local id = entity_id(e)
+  known_entities[id] = e
+  local ok, tags = pcall(function() return e:GetTags() end)
+  local o = {id = id, kind = "entity", entity = e, class = w3.classof(e), template = e:GetReadableName(),
+             tags = ok and tags or {}, pos = v3(pos), rot = e:GetWorldRotation(), meshes = meshes,
+             mesh = meshes[1] and meshes[1].mesh, loaded = true}
+  if lo[1] < 1e29 then
+    o.min, o.max = {X = lo[1], Y = lo[2], Z = lo[3]}, {X = hi[1], Y = hi[2], Z = hi[3]}
+  end
+  if p then
+    local q = o.min and {X = math.max(o.min.X, math.min(p.X, o.max.X)), Y = math.max(o.min.Y, math.min(p.Y, o.max.Y)),
+                         Z = math.max(o.min.Z, math.min(p.Z, o.max.Z))} or pos
+    o.distance = math.sqrt((q.X - p.X) ^ 2 + (q.Y - p.Y) ^ 2 + (q.Z - p.Z) ^ 2)
+  end
+  return o
+end
+local function merged_object(m)
+  m.id = (m.source == "world" and "world" or m.source) .. ":" .. m.index
+  m.pos = m.origin
+  return m
+end
+local function mark_loaded(list)  -- loaded: a merged mesh of the world's block is streamed in (has a render proxy)
+  local idx = {}
+  for _, o in ipairs(list) do if o.source == "world" then idx[#idx + 1] = o.index end end
+  local px = #idx > 0 and w3._sector_proxies(world(), idx) or {}
+  for _, o in ipairs(list) do
+    if o.source == "world" then o.loaded = px[o.index] ~= nil end
+  end
+end
+-- {kinds = {"mesh", "entity"}} (also "proxy": a house as it is drawn from afar, "volume"), max (entities, 500)
+function w3.world.objects(pos, radius, opts)
+  opts = opts or {}
+  local p, want, out = vec(pos), {}, {}
+  radius = radius or 5
+  for _, k in ipairs(opts.kinds or {"mesh", "entity"}) do want[k] = true end
+  if want.mesh or want.proxy or want.volume then
+    for _, m in ipairs(w3.world.merged(p, radius)) do
+      if want[m.kind] then out[#out + 1] = merged_object(m) end
+    end
+    mark_loaded(out)
+  end
+  if want.entity then
+    local ents = w3.call("FindGameplayEntitiesInSphere", nil, p, radius, opts.max or 500)
+    for _, e in ipairs(type(ents) == "table" and ents or {}) do
+      if e ~= w3.player() then out[#out + 1] = entity_object(e, p) end
+    end
+  end
+  table.sort(out, function(a, b) return a.distance < b.distance end)
+  return out
+end
+function w3.world.object(id)  -- the object of an id from w3.world.objects, or nil (an entity that is gone)
+  local src, rest = id:match("^(.*):(%d+)$")
+  if src and src ~= "entity" then
+    for _, b in ipairs(merged_blocks()) do
+      if b.source == src or (src ~= "world" and b.source:lower() == src:lower()) then
+        local m = (w3._sector_meshes(b.addr, tonumber(rest)) or {})[1]
+        if not m then return nil end
+        local o = merged_object(merged_entry(m, b.source, {X = m.m[10], Y = m.m[11], Z = m.m[12]}))
+        mark_loaded({o})
+        return o
+      end
+    end
+    return nil
+  end
+  local e = known_entities[id]
+  if not (e and w3.valid(e)) and id:sub(1, 7) == "entity:" then
+    e = nil
+    for _, c in ipairs(w3.all("CEntity")) do
+      if entity_id(c) == id then e = c break end
+    end
+  end
+  if e and w3.valid(e) then return entity_object(e) end
+end
+-- a merged mesh of the world's block ("world:<index>", or its object from w3.world.objects) out of the world, its
+-- collision with it: gone the next frame and kept out while the world streams; restream brings it back within a
+-- second or two. For this world only (a load brings it back). A layer's own block ("<layer>:<index>") streams
+-- elsewhere: there w3.world.sector_hide. -> true, or nil and why
+local function world_index(id)
+  if type(id) == "table" then id = id.id end
+  local n = type(id) == "string" and id:match("^world:(%d+)$")
+  if n then return tonumber(n) end
+  return nil, "not a merged mesh of the world's block (an id \"world:<index>\" of w3.world.objects): " .. tostring(id)
+end
+local function unstream(id, on)
+  local i, why = world_index(id)
+  if not i then return nil, why end
+  local n = w3._sector_unstream(world(), i, on)
+  if n == nil then return nil, "the world has no sector streamer (main menu, or another game build)" end
+  if n == 0 then return nil, on and "it was not taken out" or ("no object " .. i .. " in the world's block") end
+  return true
+end
+function w3.world.unstream(id) return unstream(id, false) end
+function w3.world.restream(id) return unstream(id, true) end
+function w3.world.unstreamed(id)  -- is it taken out by w3.world.unstream?
+  local i = world_index(id)
+  return i ~= nil and w3._sector_unstream(world(), i) == true
+end
+local function inside(m, q, tol)  -- the point lies in the mesh's box in its own axes
+  local A, o = m.axes, m.origin
+  local a, b, c = A[1], A[2], A[3]
+  -- world = origin + l.x * a + l.y * b + l.z * c: solve for l (Cramer)
+  local d = {q.X - o.X, q.Y - o.Y, q.Z - o.Z}
+  local function det(x, y, z)
+    return x[1] * (y[2] * z[3] - y[3] * z[2]) - x[2] * (y[1] * z[3] - y[3] * z[1]) + x[3] * (y[1] * z[2] - y[2] * z[1])
+  end
+  local va, vb, vc = {a.X, a.Y, a.Z}, {b.X, b.Y, b.Z}, {c.X, c.Y, c.Z}
+  local D = det(va, vb, vc)
+  if math.abs(D) < 1e-9 then return false end
+  local l = {det(d, vb, vc) / D, det(va, d, vc) / D, det(va, vb, d) / D}
+  local lo, hi = m.local_box.min, m.local_box.max
+  local function within(v, x, y, s) return v >= x - tol / s and v <= y + tol / s end
+  local function len(v) return math.max(1e-6, math.sqrt(v[1] ^ 2 + v[2] ^ 2 + v[3] ^ 2)) end
+  return within(l[1], lo.X, hi.X, len(va)) and within(l[2], lo.Y, hi.Y, len(vb)) and within(l[3], lo.Z, hi.Z, len(vc))
+end
+-- what a ray hits first: the object (as w3.world.objects gives it) with hit (the point) and normal; a merged mesh is
+-- the smallest whose box holds the point. {kind = "terrain"} or {kind = "world"} (no mesh found), nil for no hit.
+function w3.world.pick(a, b, opts)
+  local h = w3.world.cast(a, b, opts)[1]
+  if not h then return nil end
+  local o
+  if h.entity then
+    o = entity_object(h.entity, h.pos)
+  else
+    local best, size
+    for _, m in ipairs(w3.world.merged(h.pos, 0.1)) do
+      if m.kind == "mesh" and inside(m, h.pos, 0.05) then
+        local s = m.size.x * m.size.y * m.size.z
+        if not size or s < size then best, size = m, s end
+      end
+    end
+    o = best and merged_object(best) or {kind = h.what}
+    if best then mark_loaded({o}) end
+  end
+  o.hit, o.normal = h.pos, h.normal
+  return o
+end
+
+-- --- outlines in the Witcher senses on any object (highlight.cpp): an entity's meshes and the world's merged meshes.
+-- The focus mode outlines a render proxy by a bit of its light channels; the game has two colours for them, "clue"
+-- (red, bit 0x08: clues, an actor in focus) and "interactive" (yellow, bit 0x04: doors, chests). A colour given here
+-- turns that group to it while the group has an outline of TW3SE's (the game's own objects of the group with it).
+-- Proxies come and go as the world streams and an entity builds its look anew: the bits go on again 5 times a second.
+w3.highlight = {}
+local HL = w3._highlight or {list = {}, next = 0, saved = {}}
+w3._highlight = HL
+local HL_GROUPS = {clue = {bit = 0x08, slots = {0, 2}}, interactive = {bit = 0x04, slots = {1, 3}}}
+local function color_of(c)  -- 0xAARRGGBB (no alpha: 0.7), {r, g, b [, a]} 0..1 -> r, g, b, a
+  if type(c) == "table" then return c[1] or c.r, c[2] or c.g, c[3] or c.b, c[4] or c.a or 0.7 end
+  local a = (c >> 24) & 0xff
+  return ((c >> 16) & 0xff) / 255, ((c >> 8) & 0xff) / 255, (c & 0xff) / 255, a == 0 and 0.7 or a / 255
+end
+local function group_in_use(name)
+  for _, t in pairs(HL.list) do if t.group == name then return true end end
+  return false
+end
+local function restore_color(name)
+  local saved = HL.saved[name]
+  if not saved or group_in_use(name) then return end
+  for i, slot in ipairs(HL_GROUPS[name].slots) do w3._focus_color(slot, table.unpack(saved[i])) end
+  HL.saved[name] = nil
+end
+local function proxies_of(t, sector)
+  local out = {}
+  if t.index then
+    out[1] = sector[t.index]
+  else
+    local e = t.entity
+    if not w3.valid(e) then return out end
+    for _, c in ipairs(t.component and {t.component} or e.components or {}) do
+      if w3.valid(c) and drawn(c) then
+        local px = w3.peek(w3.addr(c), 0x158)
+        if px and px ~= 0 then out[#out + 1] = px end
+      end
+    end
+  end
+  return out
+end
+local function hl_apply()
+  local idx = {}
+  for _, t in pairs(HL.list) do if t.index then idx[#idx + 1] = t.index end end
+  local ok, w = pcall(world)
+  local sector = (ok and #idx > 0 and w3._sector_proxies(w, idx)) or {}
+  for _, t in pairs(HL.list) do
+    t.current = proxies_of(t, sector)
+    for _, px in ipairs(t.current) do
+      local before = w3._proxy_lc(px, t.bit, 0)
+      if before and not t.seen[px] then
+        t.seen[px] = true
+        if before & t.bit ~= 0 then t.had[px] = true end  -- the game's own outline: stays when this one goes
+      end
+    end
+  end
+end
+local function target_of(x)
+  if type(x) == "string" then x = w3.world.object(x) or error("no object " .. x, 3) end
+  if type(x) == "table" then
+    if x.entity then return {entity = x.entity, id = x.id} end
+    if x.source == "world" and x.index then return {index = x.index, id = x.id} end
+    error("only an entity or a merged mesh of the world's block can be outlined", 3)
+  end
+  local ok, comps = pcall(function() return x.components end)
+  if ok and comps then return {entity = x, id = entity_id(x)} end
+  local okc, e = pcall(function() return x:GetEntity() end)
+  if okc and e then return {entity = e, component = x, id = entity_id(e)} end
+  error("w3.highlight.add needs an id, an object of w3.world.objects, an entity or a component", 3)
+end
+-- TW3SE's colour of its own (highlight.cpp; the focus mask has a channel for one): slot 0 -> {key, count}; its
+-- objects carry the slot's stencil bit (HL.bit, nil: the one highlight.cpp chose)
+HL.extra = HL.extra or {}
+local function extra_slot(color)
+  local key = type(color) == "table" and table.concat({color_of(color)}, ",") or tostring(color)
+  local s = HL.extra[0]
+  if s and s.key == key then s.count = s.count + 1 return 0, s.bit end
+  if s then error("a colour of your own is in use; remove its outlines first or use a group", 3) end
+  local r, g, b, a = color_of(color)
+  local bit = w3._focus_extra(0, r * a, g * a, b * a, a, HL.bit)
+  if not bit then return nil end
+  HL.extra[0] = {key = key, count = 1, bit = bit}
+  return 0, bit
+end
+local function extra_release(k)
+  local s = HL.extra[k]
+  if not s then return end
+  s.count = s.count - 1
+  if s.count <= 0 then
+    w3._focus_extra(k)
+    HL.extra[k] = nil
+  end
+end
+-- outlines an object: an id or object of w3.world.objects, an entity or one component. opts = {color = 0xFFFF4FB4}
+-- (a colour of its own; one at a time) or {group = "clue" | "interactive"} (the game's red or yellow; with color that
+-- group turns to the colour) -> a handle for w3.highlight.remove. Seen in the Witcher senses.
+function w3.highlight.add(target, opts)
+  opts = opts or {}
+  local t = target_of(target)
+  if opts.color and not opts.group then
+    local k, bit = extra_slot(opts.color)
+    if k then
+      t.extra, t.bit, t.seen, t.had, t.current = k, bit, {}, {}, {}
+      HL.next = HL.next + 1
+      HL.list[HL.next] = t
+      if not HL.tick then HL.tick = w3._as("tw3se", w3.every, 0.2, function() pcall(hl_apply) end) end
+      hl_apply()
+      return HL.next
+    end
+  end
+  local name = opts.group or "clue"
+  local g = HL_GROUPS[name] or error("group is clue or interactive", 2)
+  if opts.color then
+    local r, gr, b, a = color_of(opts.color)
+    if not HL.saved[name] then
+      local saved = {}
+      for i, slot in ipairs(g.slots) do saved[i] = {w3._focus_color(slot)} end
+      if not saved[1][1] then error("the focus mode's colours were not found in this build", 2) end
+      HL.saved[name] = saved
+    end
+    for _, slot in ipairs(g.slots) do w3._focus_color(slot, r * a, gr * a, b * a, a) end
+  end
+  t.group, t.bit, t.seen, t.had, t.current = name, g.bit, {}, {}, {}
+  HL.next = HL.next + 1
+  HL.list[HL.next] = t
+  if not HL.tick then HL.tick = w3._as("tw3se", w3.every, 0.2, function() pcall(hl_apply) end) end
+  hl_apply()
+  return HL.next
+end
+function w3.highlight.remove(h)
+  local t = HL.list[h]
+  if not t then return false end
+  HL.list[h] = nil
+  local kept = {}
+  for _, o in pairs(HL.list) do
+    if o.bit == t.bit then for _, px in ipairs(o.current) do kept[px] = true end end
+  end
+  for _, px in ipairs(t.current) do
+    if not t.had[px] and not kept[px] then w3._proxy_lc(px, 0, t.bit) end
+  end
+  if t.extra then extra_release(t.extra) else restore_color(t.group) end
+  if not next(HL.list) and HL.tick then w3.off_tick(HL.tick) HL.tick = nil end
+  return true
+end
+function w3.highlight.clear()
+  for h in pairs(HL.list) do w3.highlight.remove(h) end
+end
+function w3.highlight.list()  -- {handle = id}
+  local out = {}
+  for h, t in pairs(HL.list) do out[h] = t.id end
+  return out
+end
 end
 )TW3SELIB" R"TW3SELIB(
 -- Any mesh of the game in the world, with its collision, without a template file: an entity's compiled data
@@ -2418,6 +2897,16 @@ function w3.anim.shape(actor, bones)
   local r = w3._anim_shape(c, bones or {})
   w3._shaped[w3.addr(c)] = next(bones or {}) and bones or nil  -- for w3.figure.look
   return r
+end
+-- An arm reaches a point in the world: a two-bone IK on bicep, forearm and hand, every frame until off.
+-- w3.anim.reach(actor, {hand = "l" | "r", target = pos, weight = 0..1, ahead = 0.10, out = 0.05}); nil or weight 0: off.
+-- ahead and out place the grip point: from the wrist toward the middle finger, out of the palm (metres).
+function w3.anim.reach(actor, opts)
+  local c = animated(actor)
+  if not opts or (opts.weight or 1) <= 0 then return w3._anim_reach(c) end
+  local t = opts.target or error("w3.anim.reach: target is needed", 2)
+  return w3._anim_reach(c, opts.hand or "l", t.X or t[1], t.Y or t[2], t.Z or t[3], opts.weight or 1, opts.ahead or 0.10,
+    opts.out or 0.05)
 end
 -- the bone names of a figure's rig (or of an animated component's: a head's CMimicComponent has the face's)
 function w3.anim.bones(actor) return w3._anim_bones(animated(actor)) end

@@ -32,7 +32,9 @@ using Pass_t = bool (*)(void* unused, void* param2, void* files, uint64_t a4, ui
 using Gather_t = void (*)(void* unused, void* files, void* other);
 using Compile_t = bool (*)(void* a1, void* a2, void* a3, void* result, uint64_t a5, uint64_t a6);
 using Step_t = bool (*)(void* self, uint64_t a2);                     // prepare, finish
-using Apply_t = bool (*)(void* self, void* param2, void* result, uint64_t full);
+// ApplyCompiledScripts' result: a bool in 5.01 (1 = applied), a code in 5.02 (0 = applied, 2 = the code did not fit,
+// 7 = nothing compiled to apply). Its caller reads all of eax in 5.02, so the hook passes the whole value on.
+using Apply_t = uint32_t (*)(void* self, void* param2, void* result, uint64_t full);
 using Relink_t = bool (*)(void* self, void* a2, void* a3, uint64_t a4);
 using Swap_t = bool (*)(void* ctx, void* result, uint64_t full, uint64_t a4);
 using ResultFree_t = void (*)(void* result);
@@ -105,6 +107,33 @@ void* CallTo(uintptr_t fn, const uint8_t* head, size_t n, uint32_t range = 0x400
     }
     return found;
 }
+// In ApplyCompiledScripts: the call of RelinkRTTI (5.01 +36, 5.02 +29) and the swap, the call after
+// `movzx r8d, bpl; lea rcx, [rsp+40h]; mov rdx, rsi` (5.01 +fb, 5.02 +ee). Null when not exactly one.
+void* RelinkCall(uintptr_t apply) {
+    uintptr_t relink = Address("CScriptingSystem::RelinkRTTI");
+    if (!apply || !relink) return nullptr;
+    void* found = nullptr;
+    for (uint32_t off = 0; off < 0x80; ++off)
+        if (CallTarget(apply, off) == reinterpret_cast<void*>(relink)) {
+            if (found) return nullptr;
+            found = reinterpret_cast<void*>(relink);
+        }
+    return found;
+}
+void* SwapCall(uintptr_t apply) {
+    static const uint8_t before[12] = {0x44, 0x0f, 0xb6, 0xc5, 0x48, 0x8d, 0x4c, 0x24, 0x40, 0x48, 0x8b, 0xd6};
+    if (!apply) return nullptr;
+    void* found = nullptr;
+    for (uint32_t off = 0; off < 0x180; ++off) {
+        uint8_t got[sizeof before] = {};
+        if (!SafeRead(reinterpret_cast<void*>(apply + off), got, sizeof got) || memcmp(got, before, sizeof before) != 0)
+            continue;
+        if (found) return nullptr;
+        found = CallTarget(apply, off + sizeof before);
+    }
+    return found;
+}
+
 const uint8_t kPrepareHead[24] = {0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xec, 0x70, 0x80, 0xb9,
                                   0x75, 0x01, 0x00, 0x00, 0x00, 0x0f, 0xb6, 0xf2, 0x48, 0x8b, 0xf9, 0x74};
 const uint8_t kResultFreeHead[24] = {0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c, 0x24, 0x10, 0x48, 0x89,  // 5.01 +234
@@ -262,14 +291,14 @@ bool PrepareHook(void* self, uint64_t a2) {
     return ok;
 }
 
-bool ApplyHook(void* self, void* param2, void* result, uint64_t full) {
+uint32_t ApplyHook(void* self, void* param2, void* result, uint64_t full) {
     uint8_t mode = result ? *reinterpret_cast<uint8_t*>(reinterpret_cast<char*>(result) + 0x6c) : 0xff;
     Log("reload:   apply begins full=%llu result+0x6c=%u (%s)", static_cast<unsigned long long>(full & 0xff), mode,
         Flags().c_str());
     double t = Now();
-    bool ok = oApply(self, param2, result, full);
-    Log("reload:   apply ends ok=%d in %.0f ms (%s)", ok, Now() - t, Flags().c_str());
-    return ok;
+    uint32_t r = oApply(self, param2, result, full);
+    Log("reload:   apply ends result=%u in %.0f ms (%s)", r, Now() - t, Flags().c_str());
+    return r;
 }
 
 bool RelinkHook(void* self, void* a2, void* a3, uint64_t a4) {
@@ -637,11 +666,27 @@ void* FindUnique(const uint8_t* bytes, size_t n) {
 }
 
 using Rollback_t = bool (*)(void* self);
-Rollback_t RollbackFn() {  // 5.01: +270d050, build 6adfbd7a: +270b260
+Rollback_t RollbackFn() {  // 5.01: +270d050, build 6adfbd7a: +270b260, 5.02: +27219f0 (without the 0x175 check)
     static const uint8_t expect[24] = {0x40, 0x53, 0x48, 0x83, 0xec, 0x50, 0x80, 0xb9, 0x75, 0x01, 0x00, 0x00,
                                        0x00, 0x48, 0x8b, 0xd9, 0x75, 0x08, 0x32, 0xc0, 0x48, 0x83, 0xc4, 0x50};
-    static void* fn = FindUnique(expect, sizeof expect);
+    static const uint8_t expect502[18] = {0x41, 0x56, 0x48, 0x83, 0xec, 0x50, 0x4c, 0x8d, 0x41,
+                                          0x7c, 0x4c, 0x8b, 0xf1, 0x41, 0x83, 0x78, 0x08, 0x00};
+    static void* fn = [] {
+        void* f = FindUnique(expect, sizeof expect);
+        return f ? f : FindUnique(expect502, sizeof expect502);
+    }();
     return reinterpret_cast<Rollback_t>(fn);
+}
+
+// 5.02 (+2723390): the per-mod apply takes (scripting system, 0, the file's path) and returns a code: 0 loaded,
+// 3 the file could not be read or is of another version, 4 its code does not fit (it sets 0x177; the caller rolls
+// back), 7 no pass is open. The 5.01 form below has two failure flags instead.
+using ApplyBlob502_t = uint32_t (*)(void* self, uint64_t zero, void* path);
+ApplyBlob502_t ApplyBlob502Fn() {
+    static const uint8_t expect[26] = {0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x10, 0x48, 0x89, 0x70, 0x18, 0x57, 0x48,
+                                       0x81, 0xec, 0x20, 0x02, 0x00, 0x00, 0x80, 0xb9, 0x77, 0x01, 0x00, 0x00, 0x00};
+    static void* fn = FindUnique(expect, sizeof expect);
+    return reinterpret_cast<ApplyBlob502_t>(fn);
 }
 
 ApplyBlob_t ApplyBlobFn() {  // 5.01: +270e900, build 6adfbd7a: +270cb00
@@ -672,6 +717,8 @@ std::string BlobPathText(void* path) {
     return buf;
 }
 
+void BlobFailed(const std::string& p, const char* why);
+
 bool ApplyBlobHook(void* self, uint64_t zero, void* path, uint8_t* failRead, uint8_t* failApply) {
     bool ok = oApplyBlob(self, zero, path, failRead, failApply);
     std::string p = BlobPathText(path);
@@ -682,12 +729,31 @@ bool ApplyBlobHook(void* self, uint64_t zero, void* path, uint8_t* failRead, uin
     const char* why = failRead && *failRead ? "the file could not be read, or it is of another game version"
                       : failApply && *failApply ? "its code does not fit the game's scripts: a function or type it uses is missing"
                                                 : "not loaded";
+    BlobFailed(p, why);
+    return ok;
+}
+
+void BlobFailed(const std::string& p, const char* why) {
     Log("scripts: compiled scripts did NOT load: %s (%s) - the game takes them out again", p.c_str(), why);
-    // The game ends itself ~30 s later, with code 0 and without TW3SE too (measured): the crash report at
+    // The game ends itself ~30 s later, with code 0 and without TW3SE too (measured on 5.01): the crash report at
     // the next start says which mod it was
     std::string note = "a mod's compiled scripts did not load: " + p + " (" + why + "); the game ends itself after that";
     SessionNoteFor(note.c_str(), 120);
-    return ok;
+}
+
+ApplyBlob502_t oApplyBlob502 = nullptr;
+
+uint32_t ApplyBlob502Hook(void* self, uint64_t zero, void* path) {
+    uint32_t r = oApplyBlob502(self, zero, path);
+    std::string p = BlobPathText(path);
+    if (r == 0) {
+        Log("scripts: compiled scripts loaded: %s", p.c_str());
+        return r;
+    }
+    BlobFailed(p, r == 3   ? "the file could not be read, or it is of another game version"
+                  : r == 4 ? "its code does not fit the game's scripts: a function or type it uses is missing"
+                           : "not loaded");
+    return r;
 }
 
 bool GamePassGuarded(DWORD* code, ApplyBlob_t apply, const char* blob, uint32_t blobSize, uint8_t* fails) {
@@ -1224,12 +1290,15 @@ void InstallHotReload() {
            reinterpret_cast<void**>(&oFinish), "finish");
     HookNamed("CScriptingSystem::ApplyCompiledScripts", reinterpret_cast<void*>(&ApplyHook),
               reinterpret_cast<void**>(&oApply));
-    HookAt(CallTarget(apply, 0x36), reinterpret_cast<void*>(&RelinkHook), reinterpret_cast<void**>(&oRelink), "relink");
-    HookAt(CallTarget(apply, 0xfb), reinterpret_cast<void*>(&SwapHook), reinterpret_cast<void**>(&oSwap), "swap");
+    HookAt(RelinkCall(apply), reinterpret_cast<void*>(&RelinkHook), reinterpret_cast<void**>(&oRelink), "relink");
+    HookAt(SwapCall(apply), reinterpret_cast<void*>(&SwapHook), reinterpret_cast<void**>(&oSwap), "swap");
     if (ApplyBlob_t blob = ApplyBlobFn()) {  // this build of witcher3.exe only (its bytes checked)
         g_applyBlob = blob;
         HookAt(reinterpret_cast<void*>(blob), reinterpret_cast<void*>(&ApplyBlobHook),
                reinterpret_cast<void**>(&oApplyBlob), "compiled scripts load");
+    } else if (ApplyBlob502_t blob = ApplyBlob502Fn()) {  // 5.02's form
+        HookAt(reinterpret_cast<void*>(blob), reinterpret_cast<void*>(&ApplyBlob502Hook),
+               reinterpret_cast<void**>(&oApplyBlob502), "compiled scripts load");
     }
     KeepStartFiles();
     PreScanClashes();

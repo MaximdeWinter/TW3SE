@@ -388,6 +388,17 @@ bool ReadDds(const std::vector<uint8_t>& d, DdsInfo& out, std::string& err) {
     return true;
 }
 
+// The texture cache key of a texture of its own (a DDS under a path the game has no texture for): FNV-1a 32 over its
+// .xbm path, lower case. tools\new_texture.py writes the same key into the .xbm.
+uint32_t OwnTextureKey(const std::string& xbmPath) {
+    uint32_t h = 0x811c9dc5u;
+    for (unsigned char ch : xbmPath) {
+        h ^= static_cast<unsigned char>(tolower(ch));
+        h *= 0x01000193u;
+    }
+    return h;
+}
+
 // One texture's data: its pieces (one per mip whose longer side is above 32, the rest together), each with its
 // 9-byte head.
 bool TexturePieces(const std::vector<uint8_t>& dds, const TexEntry& like, std::vector<uint8_t>& data,
@@ -445,9 +456,29 @@ bool BuildTextureCache(const std::wstring& root, const std::vector<LooseFile>& d
         std::vector<uint8_t> data;
         std::vector<uint32_t> offsets;
         uint32_t size = 0;
-        if (!found[name]) err = "the game has no texture " + name;
-        else if (!ReadAll(f.full, raw)) err = "cannot read the file";
-        else TexturePieces(raw, e, data, offsets, size, err);
+        bool own = false;
+        if (!ReadAll(f.full, raw)) {
+            err = "cannot read the file";
+        } else if (!found[name]) {
+            // a texture of its own: no game texture under this path, so the entry comes from the DDS itself, under
+            // the key OwnTextureKey(path); the .xbm beside it (a loose file, tools\new_texture.py) holds that key
+            DdsInfo di;
+            if (ReadDds(raw, di, err)) {
+                e = TexEntry{};
+                e.key = OwnTextureKey(name);
+                e.align = 16;
+                e.width = static_cast<uint16_t>(di.width);
+                e.height = static_cast<uint16_t>(di.height);
+                e.mips = static_cast<uint16_t>(di.mips);
+                e.slices = 1;
+                e.format = di.format;
+                e.format2 = 4;
+                own = true;
+                TexturePieces(raw, e, data, offsets, size, err);
+            }
+        } else {
+            TexturePieces(raw, e, data, offsets, size, err);
+        }
         if (!err.empty()) {
             Log("loose files: %s left out - %s", f.path.c_str(), err.c_str());
             continue;
@@ -467,7 +498,11 @@ bool BuildTextureCache(const std::wstring& root, const std::vector<LooseFile>& d
         names.push_back(0);
         entries.insert(entries.end(), reinterpret_cast<uint8_t*>(&e), reinterpret_cast<uint8_t*>(&e) + 52);
         ++count;
-        Log("loose files: %s replaces the pixels of %s (%ux%u)", f.path.c_str(), name.c_str(), e.width, e.height);
+        if (own)
+            Log("loose files: %s is a texture of its own, %s (%ux%u, key %08x)", f.path.c_str(), name.c_str(), e.width,
+                e.height, e.key);
+        else
+            Log("loose files: %s replaces the pixels of %s (%ux%u)", f.path.c_str(), name.c_str(), e.width, e.height);
     }
     if (!count) return false;
     out.resize((out.size() + 4095) & ~size_t(4095), 0);

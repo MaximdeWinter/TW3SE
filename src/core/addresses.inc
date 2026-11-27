@@ -7,11 +7,11 @@
 // CALL(name, function, offset of a direct call to it in function, anchor): a function too short for a signature
 // anchor: a pattern from the instruction on, unique in the function's first 0x2000 bytes (found there in other builds)
 FUNC("CCommonGame::Tick", 0x01f43750, "40 57 48 83 EC 60 C5 F8 29 74 24 20")
-FUNC_OPT("CCommonGame::OnGameStart", 0x01f47730, "40 53 48 83 EC 20 48 8B D9 45 33 C0 48 8B 89 B8 5E 01 00")
+FUNC_OPT("CCommonGame::OnGameStart", 0x01f47730, "40 53 48 83 EC 20 48 8B D9 45 33 C0 48 8B 89 B8 5E 01 00 | 40 53 48 83 EC 20 48 8B D9 45 33 C0 48 8B 89 58 61 01 00")
 FUNC_OPT("CContentManager::ScanContentPack", 0x026cfe60, "48 8B C4 4C 89 40 18 48 89 50 10 48 89 48 08 55 57 48 8D 68 B9")
 FUNC_OPT("CContentManager::CreatePackage", 0x026cfd50, "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 41 56 48 83 EC 40 48 8B EA 4C 8B F1 BF 01 00 00 00")
 FUNC_OPT("CContentManager::AttachPackage", 0x026d4620, "40 53 56 48 83 EC 28 83 7A 44 01 48 8B F2")
-FUNC_OPT("CContentManager::LoadModioMods", 0x026d6740, "48 89 54 24 10 48 89 4C 24 08 55 56 41 56 48 8D AC 24 C0 FE FF FF")
+FUNC_OPT("CContentManager::LoadModioMods", 0x026d6740, "48 89 54 24 10 48 89 4C 24 08 55 56 41 56 48 8D AC 24 C0 FE FF FF | 48 89 54 24 10 48 89 4C 24 08 55 56 41 56 48 8D AC 24 D0 FE FF FF")
 FUNC("CNamesPool::Get", 0x0031d930, "48 83 EC 28 48 8B 05 ?? ?? ?? ?? 48 85 C0 75 ?? E8 ?? ?? ?? ?? 48 8D 48 08 FF 15 ?? ?? ?? ?? 48 8B 05 ?? ?? ?? ?? 48 85 C0 75 ?? 38 05 ?? ?? ?? ?? 74 ?? 88 05 ?? ?? ?? ?? 48 8D 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? 48 89 05 ?? ?? ?? ?? 48 8D 0D ?? ?? ?? ?? 48 8B 05 ?? ?? ?? ?? E8 ?? ?? ?? ?? E8 ?? ?? ?? ?? 48 8D 48 08 FF 15 ?? ?? ?? ?? 48 8B 05 ?? ?? ?? ?? 48 83 C4 28 C3 CC CC CC CC CC CC 40 53")
 FUNC("CNamesPool::AddEntry", 0x026b0e00, "48 89 5C 24 20 55 41 56 41 57 48 83 EC 20 4C 8B F2")
 FUNC_OPT("CDLCManager::Scan", 0x020c7540, "44 88 44 24 18 89 54 24 10 48 89 4C 24 08")
@@ -23,7 +23,7 @@ FUNC("SRTTI::Get", 0x0031fcf0, "48 83 EC 28 48 8B 05 ?? ?? ?? ?? 48 85 C0 0F 85 
 FUNC("CRTTISystem::RegisterGlobalFunction", 0x026c5f30, "48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 20 44 8B 49 44")
 FUNC_OPT("Memory::Alloc", 0x0031e220, "48 8B C4 48 89 58 10 48 89 68 18 48 89 70 20 57 41 56 41 57 48 83 EC 50 48 89 48 C8")
 FUNC("funcLogChannel", 0x0273cd80, "48 89 5C 24 08 57 48 83 EC 30 8B 05 ?? ?? ?? ?? 48 8D 3D ?? ?? ?? ?? 89 44 24 48")
-FUNC_OPT("CGameSessionManager::RestoreSession", 0x0236a020, "44 88 4C 24 20 44 88 44 24 18 55 53 56 57 41 55")
+FUNC_OPT("CGameSessionManager::RestoreSession", 0x0236a020, "44 88 4C 24 20 44 88 44 24 18 55 53 56 57 41 55 | 48 8B C4 44 88 48 20 44 88 40 18 55 41 55 48 8D A8 68 FF FF FF")
 FUNC_OPT("funcLoadResource", 0x0273c5b0, "48 8B C4 4C 89 40 18 55 48 8D 68 A1 48 81 EC B0 00 00 00")
 FUNC_OPT("funcLoadResourceAsync", 0x0273c0c0, "48 8B C4 55 48 8D 68 A1 48 81 EC 90 00 00 00 48 89 58 08 33 C9 48 89 70 F0")
 FUNC_OPT("CompareFunctionSignature", 0x02778fc0, "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 20 4C 89 44 24 18 57 41 54 41 55 41 56 41 57 48 83 EC 40")
@@ -34,10 +34,10 @@ FUNC_OPT("CClass::AddProperty", 0x026bacb0, "48 89 5C 24 10 48 89 74 24 18 57 48
 FUNC_OPT("CClass::GetProperties", 0x026baa80, "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 20 48 8B D9 48 8B F2 48 8B 49 10")
 FUNC_OPT("CFunction::GetParameters", 0x026f4c50, "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 8B 59 30")
 FUNC_OPT("IScriptable::GetClass", 0x0031fa70, "48 8B 41 18 C3 CC CC CC CC CC CC CC CC CC CC CC 8B 41 50")
-FUNC("CRTTISystem::FindType", 0x026c4bc0, "48 89 4C 24 08 55 53 41 54 48 8D AC 24 50 FD FF FF")
+FUNC("CRTTISystem::FindType", 0x026c4bc0, "48 89 4C 24 08 55 53 41 54 48 8D AC 24 50 FD FF FF | 48 89 4C 24 08 55 53 41 55 48 8D AC 24 50 FC FF FF")
 FUNC_OPT("CClass::GetKind", 0x0031f6e0, "B8 02 00 00 00 C3 CC CC CC CC CC CC CC CC CC CC 8B 41 6C")
 FUNC("RegisterNative_CPPForceActorLOD", 0x02065190, "40 53 48 83 EC 30 BA F8 00 00 00 48 8D 4C 24 20 41 B8 10 00 00 00 E8 ?? ?? ?? ?? 48 8B 5C 24 20 33 D2 4C 8B 44 24 28 48 8B CB E8 ?? ?? ?? ?? 48 85 DB 74 ?? E8 ?? ?? ?? ?? 48 8D 15 ?? ?? ?? ?? 48 8B C8 E8 ?? ?? ?? ?? 4C 8D 05 ?? ?? ?? ?? 89 44 24 40 48 8D 54 24 40 48 8B CB E8 ?? ?? ?? ?? 48 8B D8 E8 ?? ?? ?? ?? 48 8B D3 48 8B C8 48 83 C4 30 5B E9 ?? ?? ?? ?? CC CC CC CC CC CC CC CC 48 83 EC 68")
-FUNC("ResolveScriptGlobalByName", 0x00bbad70, "44 89 4C 24 20 48 89 4C 24 08 55 53 56 57 41 54 41 55 41 56 48 8D 6C 24 E1")
+FUNC("ResolveScriptGlobalByName", 0x00bbad70, "44 89 4C 24 20 48 89 4C 24 08 55 53 56 57 41 54 41 55 41 56 48 8D 6C 24 E1 | 44 89 4C 24 20 48 89 4C 24 08 55 53 56 57 41 54 41 55 41 56 48 8D 6C 24 F0")
 FUNC_OPT("CScriptedClass::ForEachPropertyPair", 0x026b5dd0, "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 20 33 DB 49 8B F8")
 FUNC("CFunction::CFunctionMethod", 0x026f54c0, "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 33 F6 48 89 51 08 48 8D 05 ?? ?? ?? ?? 48 8B F9")
 FUNC_OPT("funcGetComponent", 0x02252900, "48 83 EC 38 48 89 5C 24 40 41 B9 0E 00 00 00 48 89 74 24 48")
@@ -47,14 +47,14 @@ FUNC_OPT("funcTeleportWithRotation", 0x02252c50, "48 89 5C 24 08 48 89 74 24 10 
 FUNC_OPT("funcSetRawPlacement", 0x0224d0e0, "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 60 48 8B 42 30 48 8D 35 ?? ?? ?? ?? C5 F9 EF C0")
 FUNC_OPT("CScriptingSystem::ReloadScripts", 0x02706220, "48 89 5C 24 08 48 89 7C 24 10 55 48 8D 6C 24 B9")
 FUNC_OPT("CScriptingSystem::CompileAllScripts", 0x02704d90, "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 70 49 8B F1")
-FUNC_OPT("CScriptingSystem::ApplyCompiledScripts", 0x02704c10, "48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 41 56 48 83 EC 70 80 B9 75 01 00 00 00")
+FUNC_OPT("CScriptingSystem::ApplyCompiledScripts", 0x02704c10, "48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 41 56 48 83 EC 70 80 B9 75 01 00 00 00 | 48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 41 56 48 83 EC 70 41 80 78 6C 00")
 // fills two lists with the script files to compile (empty 12-byte arrays in, rcx unused); the start-up compile
 // and the REDkit editor's "Reload scripts" both gather with it first (hotreload.cpp)
-FUNC_OPT("GatherScriptFiles", 0x026d8780, "4C 8B DC 4D 89 43 18 49 89 53 10 49 89 4B 08 55 56 41 56 49 8D 6B A1 48 81 EC D0 00 00 00")
+FUNC_OPT("GatherScriptFiles", 0x026d8780, "4C 8B DC 4D 89 43 18 49 89 53 10 49 89 4B 08 55 56 41 56 49 8D 6B A1 48 81 EC D0 00 00 00 | 4C 8B DC 4D 89 43 18 49 89 53 10 49 89 4B 08 55 53")
 // the whole start-up script pass: compile, prepare (only while +0x175 is 0, sets it), apply, finish; the REDkit
 // editor's reload runs the same chain. (rcx unused, param2, files, a4, a5 byte) -> ok. Live reload calls it again.
 FUNC_OPT("CScriptingSystem::CompileAndApplyAll", 0x02705e60, "48 89 5C 24 08 48 89 74 24 10 48 89 7C 24 18 44 88 4C 24 20 55 41 54 41 55 41 56 41 57 48 8D 6C")
-FUNC_OPT("CScriptingSystem::RelinkRTTI", 0x02704eb0, "40 53 48 83 EC 30 80 B9 75 01 00 00 00")
+FUNC_OPT("CScriptingSystem::RelinkRTTI", 0x02704eb0, "40 53 48 83 EC 30 80 B9 75 01 00 00 00 | 48 83 EC 38 33 C0 48 89 5C 24 40 48 89 44 24 20")
 FUNC_OPT("CDynamicLayer::CreateAndAttachEntity", 0x0237fd60, "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B FA 48 8B F1 E8 ?? ?? ?? ?? 84 C0")
 FUNC_OPT("CDynamicLayer::InstantiateEntity", 0x0237e2c0, "48 89 5C 24 18 57 48 83 EC 40 48 8B 41 28")
 FUNC_OPT("CDynamicLayer::UnlinkEntity", 0x026c7710, "40 53 48 83 EC 20 48 8B D9 48 8D 0D ?? ?? ?? ?? FF 15 ?? ?? ?? ?? 48 8B 4B 30")
@@ -65,7 +65,7 @@ FUNC_OPT("CEntity::OnLayerAttachInit", 0x0225af10, "40 53 48 83 EC 20 48 8B D9 4
 FUNC_OPT("CEntity::SyncAttachmentPlacement", 0x02260730, "40 55 53 57 48 8D 6C 24 B9 48 81 EC 00 01 00 00")
 FUNC_OPT("CScriptCompiler::ResolveLiteralKind", 0x027d0c90, "48 89 54 24 10 48 89 4C 24 08 53 55 56 57 41 54 41 55 41 56 41 57 48 83 EC 28 8B 05 ?? ?? ?? ??")
 FUNC_OPT("CScriptCompiler::CreateLiteralNode", 0x027b61b0, "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 54 41 55 41 56 41 57 48 81 EC A0 00 00 00 8B 41 0C")
-FUNC_OPT("CRemoteConnection::ExecCommand", 0x024d4de0, "48 8B C4 55 41 56 48 8B EC 48 83 EC 78 48 8B 0D ?? ?? ?? ??")
+FUNC_OPT("CRemoteConnection::ExecCommand", 0x024d4de0, "48 8B C4 55 41 56 48 8B EC 48 83 EC 78 48 8B 0D ?? ?? ?? ?? | 48 89 5C 24 08 48 89 74 24 10 48 89 7C 24 18 4C 89 64 24 20 55 41 56 41 57 48 8B EC 48 83 EC 60")
 FUNC_OPT("CScriptCompiler::CompileCall", 0x027b6ed0, "48 89 5C 24 10 48 89 6C 24 18 56 57 41 54 41 56 41 57 B8 40 10 00 00")
 FUNC("CScriptCompiler::DeclareGlobalFunction", 0x0277c790, "40 53 41 54 41 57 48 83 EC 40 45 0F B6 E0")
 FUNC_OPT("CEntity::AttachToWorld", 0x02255100, "40 53 57 48 83 EC 28 48 83 3D ?? ?? ?? ?? 00")
@@ -114,7 +114,7 @@ FUNC_OPT("CObjectsGC_MarkAndSweep::CObjectsGC_MarkAndSweep", 0x027870f0, "40 53 
 FUNC_OPT("CObjectsGC_MarkAndSweep::MarkReachable", 0x02786e50, "48 89 4C 24 08 53 56 41 54 41 57 48 83 EC 48")
 FUNC_OPT("DepotResolveAndLoad", 0x026e88d0, "48 89 5C 24 10 48 89 6C 24 18 48 89 74 24 20 57 48 83 EC 20 48 8B FA 49 8B E9")
 FUNC_OPT("DepotCacheLookup", 0x026e8ba0, "40 53 48 83 EC 30 48 8B D9 48 8B C2")
-FUNC_OPT("CDirectory::FindFile", 0x0270a000, "48 89 6C 24 18 56 57 41 55 41 56 41 57 48 83 EC 30 0F B6 AC 24 80 00 00 00")
+FUNC_OPT("CDirectory::FindFile", 0x0270a000, "48 89 6C 24 18 56 57 41 55 41 56 41 57 48 83 EC 30 0F B6 AC 24 80 00 00 00 | 48 89 74 24 18 57 41 54 41 55 41 56 41 57 48 83 EC 30 44 0F B6 AC 24 80 00 00 00")
 FUNC_OPT("funcGetWeatherNames", 0x02392d10, "48 83 EC 48 48 8B 42 30 4C 8D 0D ?? ?? ?? ?? 48 89 5C 24 50 33 DB")
 FUNC_OPT("TDynArray::GrowBy", 0x0035bf50, "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 8B 79 08 41 0F B7 F0 48 8B D9 8D 04 17 48 8B 11 89 41 08 48 85 D2 74 ?? 48 8B 0D ?? ?? ?? ?? 48 83 E1 F8 E8 ?? ?? ?? ?? EB ?? 33 C0 8B 4B 08 C1 E8 02")
 FUNC_OPT("TDynArray::AllocatedCapacity", 0x027e74e0, "4C 8B 81 00 C9 00 00 48 8B C2 4C 8B 89 08 C9 00 00 49 2B C0 4D 2B C8 4C 8B D2")
@@ -137,7 +137,7 @@ FUNC_OPT("RenderResize::Call", 0x0232dab4, "48 8D 4E 78 E8 ?? ?? ?? ?? 48 8D 4E 
 FUNC_OPT("AttachList::Remove", 0x00871760, "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B 19 48 8B F1 48 85 DB 74 17 48 8B 02 0F 1F 00 48 8B 7B 08 48 39 03 74 1A 48 8B DF 48 85 FF 75 EF 32 C0 48 8B 5C 24 30")
 FUNC_OPT("AttachList::Append", 0x004be270, "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 30 48 8B DA 48 8B F1 BA 10 00 00 00 48 8D 4C 24 20 E8 ?? ?? ?? ?? 48 8B 7C 24 20 33 D2 4C 8B 44 24 28")
 CALL("Memory::AllocDefault", "RegisterNative_CPPForceActorLOD", 0x16, "E8 ?? ?? ?? ?? 48 8B 5C 24 20")
-GLOBAL("GContentManager", "CContentManager::LoadModioMods", 0x24, 3, 7, "4C 8B 35 ?? ?? ?? ?? 4C 89 75 60")
+GLOBAL("GContentManager", "CContentManager::LoadModioMods", 0x24, 3, 7, "4C 8B 35 ?? ?? ?? ?? 4C 89 75 ?? 75")
 GLOBAL("GGame", "CModHandlerSystem::LoadModsIntoGameSystems", 0x119, 3, 7, "48 8B 05 ?? ?? ?? ?? 48 85 C0 74 ?? 80 B8 10 01 00 00 00")
 GLOBAL("GScriptNativeTable", "CFunction::CFunction", 0x65, 3, 7, "48 8D 15 ?? ?? ?? ?? 48 89 B7 F0 00 00 00")
 GLOBAL("GScriptGlobals", "ResolveScriptGlobalByName", 0x66, 3, 7, "48 8B 05 ?? ?? ?? ?? 48 8B 58 20")
@@ -158,6 +158,10 @@ FUNC_OPT("RenderCommandAlloc28", 0x004922f0, "48 83 EC 28 48 8B 0D ?? ?? ?? ?? 4
 // CDrawableComponent::RefreshRenderProxies(this): only while attached (+0x54 & 0x100000): out of the render scene,
 // proxies destroyed and made anew (slots 0x3b0, 0x3a0), back in; the mesh setter ends with it
 FUNC_OPT("CDrawableComponent::RefreshRenderProxies", 0x0234c2e0, "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 20 33 FF 48 8D 71 54 F7 41 54 00 00 10 00")
+// the main thread's half of the sector streaming update (this: the world's streaming state, +0x48 the streamer,
+// +0x58 started): waits for the streaming thread's half, then streams the chosen instances in (their slot 1) and out
+// (slot 2, then deleted). The world's tick calls it and starts the next half right after. RVA from 5.01 (6adfbd7a)
+FUNC_OPT("SectorStreaming::Finish", 0x02503740, "40 57 48 83 EC 20 0F B6 41 58 48 8B F9 84 C0 74 ?? 48 89 5C 24 30 BA FF FF FF FF 48 8B 1D")
 // CMemoryFileReader(this, data, size): two vtables, flags +0x08, data +0x18, size +0x20, offset +0x28; 0x30 bytes
 FUNC_OPT("CMemoryFileReader::CMemoryFileReader", 0x026f6400, "48 8D 05 ?? ?? ?? ?? C7 41 08 52 00 10 00 48 89 01 48 8D 05 ?? ?? ?? ?? 48 89 41 10 48 8B C1 C7 41 0C A4 00 00 00")
 // the localization manager's text for a string id: (manager, &out String, id, flag); funcGetLocStringById calls it,
@@ -189,11 +193,17 @@ FIELD("CFunction.codeSize", "Dispatch", 0x207, 0x90, "8B BE ?? ?? ?? ?? 48 03 F9
 FUNC_OPT("SDynamicDecalInitParameters::Init", 0x0234b120, "33 D2 48 89 11 48 89 51 08 8B 05 ?? ?? ?? ??")
 // the engine's helper that puts one dynamic decal on the world (footsteps): init parameters, the renderer makes
 // the decal, AddDynamicDecalToScene. Read for the renderer, its decal slot, the world's render scene, the texture slot
-FUNC_OPT("SpawnWorldDynamicDecal", 0x024d3290, "48 89 5C 24 08 48 89 74 24 10 48 89 7C 24 18 55 48 8D 6C 24 E0 48 81 EC 20 01 00 00 48 8B 9A 40 54 00 00")
+FUNC_OPT("SpawnWorldDynamicDecal", 0x024d3290, "48 89 5C 24 08 48 89 74 24 10 48 89 7C 24 18 55 48 8D 6C 24 E0 48 81 EC 20 01 00 00 48 8B 9A 40 54 00 00 | 48 89 5C 24 08 48 89 74 24 10 48 89 7C 24 18 55 48 8D 6C 24 E0 48 81 EC 20 01 00 00 48 8B 9A 60 54 00 00")
 // the dismemberment wound's decal: made the same way, sent with AddDynamicDecalToSceneForProxies to the render
 // proxies of the entity's mesh components. Read for the component's render proxy field
 FUNC_OPT("SpawnWoundDynamicDecal", 0x02620740, "4C 8B DC 49 89 4B 08 55 57 41 55 49 8D AB D8 FE FF FF")
 GLOBAL("GRender", "SpawnWorldDynamicDecal", 0x86, 3, 7, "48 8B 0D ?? ?? ?? ?? C5 FA 11 45 84")
+// The focus mode's outlines (highlight.cpp, docs/engine/render.md section 2), RVAs of 5.01 (6adfbd7a). The effect's
+// draw: two mask passes and the composite, each a full screen quad (unused, &min, &max, z); the render thread's
+// depth-stencil state (state id, stencil reference) and pixel shader constants (first index, values, count)
+FUNC_OPT("CFocusModeEffectPostFX::Apply", 0x01cfbb50, "48 8B C4 44 89 48 20 4C 89 40 18 48 89 48 08 55 53 56")
+FUNC_OPT("RenderFullscreenQuad", 0x01c998a0, "48 89 5C 24 08 55 48 8D 6C 24 A9 48 81 EC D0 00 00 00 C4 C1 7A 10 00")
+FUNC_OPT("RenderSetPixelConstants", 0x01edf680, "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 41 54 41 56 41 57 48 83 EC 20 83 F9 12")
 FIELD("CWorld.renderScene", "SpawnWorldDynamicDecal", 0x1f, 0x5440, "48 8B 9A ?? ?? ?? ?? 48 8D 4C 24 20", 3)
 FIELD("CBitmapTexture.GetRenderResourceSlot", "SpawnWorldDynamicDecal", 0x41, 0x1c0, "FF 90 ?? ?? ?? ?? 48 89 44 24 20", 2)
 FIELD("IRender.CreateDynamicDecalSlot", "SpawnWorldDynamicDecal", 0x113, 0x1e8, "FF 90 ?? ?? ?? ?? 48 8B F8", 2)

@@ -38,6 +38,7 @@ void SkinHookNoteDraw(void* pso, uint32_t slot);
 uint32_t MushQHalf();
 uint64_t SkinHookTableVa();
 uint64_t SkinHookWeightsVa();
+uint64_t SkinHookSlotVa(const uint32_t v[4]);
 bool SkinHookComputeIndices(void* rs, int* table, int* weights, int* capture);
 uint64_t SkinHookCaptureVa();
 uint64_t SkinHookMissVs(void* pso);
@@ -116,10 +117,19 @@ void TraceCount(void* pso) {
     ++g_traceCounts[pso];
 }
 
+// 24.11.: the pipeline one call of the engine sets on this thread (highlight.cpp: which one draws the focus outlines)
+thread_local bool t_psoCapture = false;
+thread_local void* t_psoCaptured = nullptr;
+thread_local void* t_psoCapturedList = nullptr;  // and the list it went on
+
 template <int K>
 void STDMETHODCALLTYPE SetPsoHook(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* pso) {
     g_trPso[K](cl, pso);
     TraceCount(pso);
+    if (t_psoCapture) {
+        t_psoCaptured = pso;
+        t_psoCapturedList = cl;
+    }
     bool skin = SkinHookOn();
     if (!g_any.load(std::memory_order_relaxed) && !skin) return;
     ListState& st = t_lists[cl];
@@ -207,7 +217,9 @@ void SkinBeforeDraw(ID3D12GraphicsCommandList* cl) {
     if (mush != ~0u) st.skinMush = ~0u - 1;  // (the half changes each frame: set every draw of a mush slot)
     if (slot != st.skinSet || base != st.skinBase || mush != st.skinMush) {
         uint32_t v[4] = {slot, base, mush, mush == ~0u ? 0u : MushQHalf()};
-        cl->SetGraphicsRoot32BitConstants(static_cast<UINT>(st.skinSlot), 4, v, 0);
+        uint64_t sv = SkinHookSlotVa(v);
+        if (!sv) return;
+        cl->SetGraphicsRootConstantBufferView(static_cast<UINT>(st.skinSlot), sv);
         st.skinSet = slot;
         st.skinBase = base;
         st.skinMush = mush;
@@ -299,6 +311,12 @@ void RenderNoteSubmitted(void* const* lists, UINT n) {
 // The skinning hook (skinhook.cpp): the list hooks. The vertex buffers and the draws come from deform.cpp's hooks
 // (they are on every list the game submits; a second hook on the same driver function is refused).
 void RenderWantDrawHooks() { Want(); }
+void RenderPsoCapture(bool on) {
+    t_psoCapture = on;
+    if (on) t_psoCaptured = t_psoCapturedList = nullptr;
+}
+void* RenderPsoCaptured() { return t_psoCaptured; }
+void* RenderPsoCapturedList() { return t_psoCapturedList; }
 std::string RenderSkinDiag() {
     char b[160];
     snprintf(b, sizeof b, "; draws: patched pipeline %llu, of them without the table's index %llu, list unknown %llu",

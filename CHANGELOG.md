@@ -1,5 +1,49 @@
 # Changelog
 
+## 1.4.3
+
+**New:**
+
+- Runs on the game's patch 5.02 (5.01 keeps working)
+- With another window in front the game draws at most 20 frames a second (`background_fps` in tw3se.config, 0 =
+  off; `w3.background_fps(n)` while the game runs)
+- `w3.world.objects(pos, radius)`: the merged meshes and the entities around a point, each with an id that stays
+  the same after a load (`world:417063`, `entity:<guid>`), its mesh path, place, rotation, box and whether it is
+  loaded
+- `w3.world.object(id)` gives an object by its id, `w3.world.pick(from, to)` the object a ray hits first
+- `w3.anim.reach(actor, {hand, target, weight})`: a hand reaches a point in the world on top of any animation
+  (two-bone IK on the arm, blended by weight)
+- `w3.world.unstream(id)` takes a merged mesh out of the world at once, with its collision, and it stays out while the
+  world streams; `w3.world.restream(id)` brings it back
+- `w3.highlight.add(target, {color = 0xFFFF4FB4})`: an outline in the Witcher senses on any entity or merged mesh
+  (furniture, walls), in a colour of your own or the game's red or yellow; `remove`, `clear`, `list`
+- `w3.patch(place, bytes)` and `w3.unpatch(handle)`: byte patches by engine name, offset or signature, taken back
+  with the mod; `w3.find_code(signature)`
+- `w3.material.assign(component, index, material)`: another material into one slot of one entity's mesh
+- `w3.cloth.of(entity)`, `simulate`, `freeze`, `reach`: a figure's cloth
+- Textures of your own: a DDS under a path the game has no texture for is a new texture, with an `.xbm` from
+  `tools/new_texture.py` beside it
+- `w3.deform.hide(component, bits)` hides triangles of a mesh (one bit per triangle, per chunk);
+  `w3.deform.unhide` shows them again, `w3.deform.hide_file` reads the bit fields from a file
+- tw3se.log names the graphics cards with their drivers and the other tools in the game: ReShade and its add-ons,
+  OptiScaler, overlays, ASI mods (`environment_log = off` leaves it out)
+
+**Fixes:**
+
+- The console pipe takes programs of this PC only (a named pipe can be reached over the network otherwise)
+- Blend shape sets on a mesh copy of its own ended after `w3.refresh` on its component
+- With OptiScaler as dxgi.dll the game hung as soon as a plugin drew. TW3SE made a swap chain of its own for the
+  present hook while the game ran, and OptiScaler took it for the game's. That swap chain is made at the start now
+- ReShade add-ons that put their settings into the game's root signatures (RenoDX) skipped the main one while
+  `skin_hook = on` was set (a black picture with RenoDX in HDR). The skinning hook binds its slot as a constant buffer
+  view now
+- With CWSO the game still froze at times while a plugin moved a mesh's vertices (a second place where TW3SE and
+  CWSO waited for each other)
+- With `overlay = off` the skinning shaders drew with their parameters unbound. The skinning hook stays off then
+- With `skin_hook = off` every pipeline with a skinning shader was refused once and made again. Those shaders stay
+  out of the pipelines now, and a replaced shader the graphics driver refuses stays out from then on
+- A guarded read in the pose hook showed up as an error in crash reports
+
 ## 1.4.2
 
 **Fixes:**

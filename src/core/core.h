@@ -9,6 +9,9 @@
 #include <vector>
 #include "tw3se/tw3se.h"
 
+struct ID3D12Device;
+struct D3D12_GRAPHICS_PIPELINE_STATE_DESC;
+
 namespace tw3se {
 
 // --- log.cpp: <game>\bin\x64_dx12\tw3se\tw3se.log
@@ -51,6 +54,8 @@ std::string AnimBoneNames(void* component, std::vector<std::string>* names);  //
 // w3.anim.shape: per bone {scale xyz, offset xyz, rot xyzw, length, inherit} on the figure every frame; empty: off
 std::string AnimShapeSet(void* component, const std::vector<std::pair<std::string, std::array<float, 12>>>& bones);
 std::string AnimRecordStop(void* component, float fps, std::vector<std::string>* bones, std::vector<float>* data);
+// w3.anim.reach: an arm's two-bone IK to a point in the world, every frame; hand 'l' / 'r', any other or weight 0: off
+std::string AnimReachSet(void* component, char hand, const float* target, float weight, float ahead, float out);
 std::string PoseLayerStats();
 void MimicRegisterCallback(TW3SE_MimicCallback cb, void* ctx);
 int MimicWatch(void* entity, int on);
@@ -79,6 +84,12 @@ uintptr_t EngineResolve(const std::string& name, std::string* err);
 uintptr_t EngineVtable(const std::string& cls, uint32_t offset);  // a class's vtable from the exe's RTTI, 0 if none
 void ExeText(const uint8_t** begin, size_t* size);  // witcher3.exe's code section in memory (for own scans)
 uint32_t FieldOr(const char* name, uint32_t retail);  // a FIELD's value from the table, else the retail offset
+std::vector<uintptr_t> SignatureScan(const char* sig, size_t max);  // every match in witcher3.exe's code
+// patch.cpp: byte patches (w3.patch); a place is an integer (below 0x10000000 an offset), an engine name or a signature
+uintptr_t PatchPlace(const std::string* name, uintptr_t value, std::string* err);
+int PatchBytes(uintptr_t at, const std::vector<uint8_t>& bytes, const std::string& owner, std::string* err);
+bool PatchRestore(int id);
+int PatchRestoreOwner(const std::string& owner);
 template <class T> T Fn(const char* name) { return reinterpret_cast<T>(Address(name)); }
 
 // --- hooks (main.cpp, MinHook)
@@ -354,6 +365,7 @@ void SessionFault(EXCEPTION_POINTERS* ep);    // editorprobe.cpp: a fault the ga
 void SessionNotesToLog();                     // diag.cpp: at an end that was not normal, the marker's notes into tw3se.log
 bool GuardableFault(DWORD code);              // editorprobe.cpp: an exception a TW3SE guard may take (not a stack overflow)
 std::string AddressPlace(uintptr_t a);        // scripting.cpp: "witcher3.exe+0x1234 (name)" for a log line
+int RttiSlot(void* type, int slot);           // catalog.cpp: an IRTTIType slot (5.01's number) in this build, -1 unknown
 void SessionNote(const char* what);           // a failure that ends with code 0 (hotreload.cpp: scripts that did not compile)
 void SessionNoteFor(const char* what, unsigned seconds);  // the same, kept only if the game ends within `seconds`
 
@@ -389,10 +401,22 @@ struct SectorMesh {
     bool collision;            // a collision object follows it
 };
 int SectorMeshes(void* sector, std::vector<SectorMesh>* out, const float* center = nullptr,
-                 float radius = 0);  // the meshes (-1: not a sector block)
+                 float radius = 0, int64_t only = -1);  // the meshes (-1: not a sector block); only: one index
 void* WorldSectorData(void* world);  // the world's CSectorDataMerged, or null
 std::string MeshPathOfHash(uint64_t hash);  // a mesh's depot path by its FNV-1a 64 hash, "" when unknown
 bool SectorSetPos(void* sector, uint32_t index, const float* pos);
+int SectorProxies(void* world, const uint32_t* ids, size_t n, void** out);  // render proxies of streamed-in objects
+int SectorUnstream(void* world, uint32_t id, bool on);  // a merged mesh out of the world at once (-1: no streamer)
+int SectorUnstreamed(void* world, uint32_t id);         // switched off by SectorUnstream: 1, 0, -1
+// --- highlight.cpp: the outlines of the Witcher senses on any render proxy
+bool ProxyChannels(void* proxy, uint8_t set, uint8_t clear, uint8_t* before);  // false: not a render proxy
+bool FocusGroupColor(int group, float* rgba, const float* set);  // group 0..3 (premultiplied colour); set may be null
+uint8_t FocusExtraColor(int slot, const float* rgba, uint8_t bit = 0);  // colour 0 or 1 (null: off; bit: another) -> its bit
+std::string FocusProbe();  // 24.11.: the pipelines of the focus effect's quads (w3._focus_probe)
+uint64_t FocusCensus(int on, uint64_t out[9]);  // the stencil bits of the frame's pixels (w3._focus_census)
+// shaders.cpp tells highlight.cpp of each graphics pipeline the game creates (the focus mask's is copied)
+void HighlightNotePipeline(::ID3D12Device* dev, const ::D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, uint64_t ps);
+void InstallHighlight();
 
 // --- configvars.cpp: the engine's configuration variables (Rendering/UseUmbraOcclusion ...)
 bool EngineConfig(const char* group, const char* name, const char* value, std::string& out, std::string& err);
@@ -465,6 +489,11 @@ int BlendShapeIndex(int set, const std::string& name);  // -1 if none
 std::vector<std::string> BlendNames(int set);
 std::string BlendState(int set);  // "loading", "ready", "lost" (mesh gone or loaded anew), "none"
 bool BlendUnload(int set);        // the original back, then the set is gone
+int HideOpen(uintptr_t renderMesh, std::string* err);  // w3.deform.hide: the mesh's hide (triangles drawn as nothing)
+bool HideBits(int hide, uint32_t chunk, const uint8_t* bits, size_t n, std::string* err);  // 1 bit per triangle
+bool HideClose(int hide);         // the original indices back
+std::string HideState(int hide);  // "loading", "ready", "lost", "none"
+int HideForget(uintptr_t renderMesh);
 int BlendForget(uintptr_t renderMesh);  // the mesh goes away: its sets end without writing the original back
 std::string IndexDump(uintptr_t renderMesh, const std::wstring& path, bool vertices = false);  // measuring: chunk
 // table + index buffer (or the vertex buffer)
@@ -514,6 +543,7 @@ bool SkinHookWeights(int slot, int chunk, const float* weights, int count, std::
 std::vector<uint32_t> SkinHookChunks(int slot);  // the vertex count of each chunk of the slot's mesh
 int SkinHookState(int slot);  // 0 no mesh, 2 active, 3 lost
 void SkinHookNoteVs(uint64_t id, const void* bytecode, size_t size);  // shaders.cpp: each vertex shader of a pipeline
+bool SkinHookKeepsOut(uint64_t id);  // skinhook.cpp: one of skinhook.txt's shaders while the hook is off
 bool SkinHookOn();
 std::string SkinHookStats();
 std::string BlendDump(uintptr_t renderMesh, const std::wstring& path, bool now = false);  // now: also with a set (as moved)  // base positions + normals as TWDB
@@ -614,6 +644,8 @@ bool LocTextClear(uint32_t id);
 int LocTextDropOwner(const std::string& owner);
 int LocTextCount();
 void RegisterPresent(TW3SE_PresentCallback callback, void* context);
+int GetBackgroundFps();          // overlay.cpp: the frame cap while another window is in front (0: none)
+void SetBackgroundFps(int fps);
 void RegisterOverlayDraw(TW3SE_OverlayDrawCallback cb, void* ctx);  // interface v10
 // ui.cpp, plugin interface 21: ImGui for plugins and .asi mods
 void UiAddPluginDraw(TW3SE_ImGuiCallback cb, void* ctx);
@@ -652,6 +684,7 @@ void StartStackSampler();  // stacksample.cpp: main-loop stack samples to a file
 void InstallEditorProbes();  // editorprobe.cpp: REDkit diagnostics (config attachprobe=on)
 void InstallGameGuard();    // editorprobe.cpp: the same in the game, in front of every vectored handler registered later
 void InstallEditorGuard();  // editorprobe.cpp: TW3SE guards take their own faults before the editor crash handler
+void InstallEnvironLog();  // environ.cpp: graphics cards and the other tools in the game, to tw3se.log
 void InstallHwWatch();  // hwwatch.cpp: `hwwatch` hardware watchpoints (who calls / writes / reads), game and editor
 LONG CALLBACK HwWatchVectored(EXCEPTION_POINTERS* ep);
 std::string HwWatchCommand(const char* args);  // the `hwwatch` command, for Lua (w3.hwwatch) on the main thread  // its handler, first in the editor's crash handler hook

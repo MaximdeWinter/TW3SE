@@ -526,8 +526,10 @@ const SkelInfo* SkeletonOf(void* comp) {
         if (it != g_noSkel.end() && it->second == block) return nullptr;
     }
     // an object of the game lies on 8 bytes; what the testers' games had there were two int32 (0x24 and 0x22, 0x10 and
-    // 0x1154: 11 000 caught reads in 10 minutes at one of them)
+    // 0x1154: 11 000 caught reads in 10 minutes at one of them). 25.11.: 0x46 and 0 even pass as one on 8 bytes; the
+    // guard caught that read, crash reports showed it as a fault - the memory asked about first (cached)
     if (!InUserSpace(block, 0x10) || (reinterpret_cast<uintptr_t>(block) & 7) ||
+        !MemReadable(static_cast<char*>(block) + 0x08, 8) ||
         !GRead(static_cast<char*>(block) + 0x08, &skel, 8) || !InUserSpace(skel, 8) || (reinterpret_cast<uintptr_t>(skel) & 7)) {
         std::lock_guard<std::mutex> lk(g_noSkelMx);
         if (g_noSkel.size() > 4096) g_noSkel.clear();
@@ -2163,7 +2165,9 @@ void* NewNative(const char* className, std::string* err) {
     uint32_t size = cls ? RttiSize(cls) : 0;
     void* vt = nullptr;
     Construct_t ctor = nullptr;
-    if (!cls || !size || !GRead(cls, &vt, 8) || !vt || !GRead(static_cast<void**>(vt) + 10, &ctor, 8) || !ctor) {
+    int construct = cls ? RttiSlot(cls, 10) : -1;  // the class's construct (11 in 5.02)
+    if (!cls || !size || construct < 0 || !GRead(cls, &vt, 8) || !vt ||
+        !GRead(static_cast<void**>(vt) + construct, &ctor, 8) || !ctor) {
         *err = std::string("the class ") + className + " cannot be made";
         return nullptr;
     }
@@ -2287,11 +2291,16 @@ std::string AnimCreate(void* comp, const char* name, float fps, const std::vecto
 
 namespace {
 using SetPostLoad_t = void (*)(void* set);
+uintptr_t g_postLoadFault = 0;  // where the last caught fault of a set's set-up was, for the log
+int PostLoadFilter(EXCEPTION_POINTERS* ep) {
+    g_postLoadFault = reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
 bool PostLoadGuarded(SetPostLoad_t fn, void* set) {
     __try {
         fn(set);
         return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    } __except (PostLoadFilter(GetExceptionInformation())) {
         return false;
     }
 }
@@ -2327,7 +2336,19 @@ std::string AnimPublish(void* set, void* comp, const char* name) {
     memcpy(static_cast<char*>(set) + animsOff, &arr, 8);
     memcpy(static_cast<char*>(set) + animsOff + 8, &one, 4);
     memcpy(static_cast<char*>(set) + animsOff + 12, &one, 4);
-    if (!PostLoadGuarded(postLoad, set)) return "the set's set-up faulted (caught)";
+    if (!PostLoadGuarded(postLoad, set)) {
+        // the set lets go of the entry again: kept, the engine would destroy a half set-up entry with the set later
+        // (5.02, 26.11.: the game crashed in the set's destructor at the next load)
+        void* none = nullptr;
+        uint32_t zero = 0;
+        memcpy(static_cast<char*>(set) + animsOff, &none, 8);
+        memcpy(static_cast<char*>(set) + animsOff + 8, &zero, 4);
+        memcpy(static_cast<char*>(set) + animsOff + 12, &zero, 4);
+        memcpy(static_cast<char*>(c->anim) + 0x10, &none, 8);
+        std::string at = AddressPlace(g_postLoadFault);
+        Log("anim: %s: the set's set-up faulted at %s (caught), the set stays empty", name, at.c_str());
+        return "the set's set-up faulted (caught)";
+    }
     Log("anim: %s is in the engine's table of animations", name);
     return "";
 }
@@ -2544,10 +2565,28 @@ void ApplyShapeGuarded(char* output, const ShapeSet* shape) {
     }
 }
 
+// w3.anim.reach (24.11.): an arm reaches a point in the world. A two-bone IK on bicep, forearm and hand, laid on the
+// local pose before the model-space step: the elbow bends until the grip point (`ahead` from the wrist toward the
+// middle finger, `out` from the palm) is as far from the shoulder as the target, then the upper arm turns it onto
+// the target. The elbow stays in the plane the animation gives it. Weight 0..1 blends from the animation's arm.
+struct Reach {
+    char hand;                            // 'l' or 'r'
+    int upper, mid, end, mid1, mid3, index1, pinky1;
+    std::shared_ptr<const std::vector<int16_t>> parents;
+    float target[3];  // world
+    float weight, ahead, out;
+};
+std::mutex g_reachMx;
+std::unordered_map<void*, std::shared_ptr<const Reach>> g_reaches;  // by component
+std::atomic<int> g_reachCount{0};
+std::atomic<int> g_reachTransposed{-1};  // the engine's quaternion convention: -1 not known yet
+void ApplyReachGuarded(char* output, char* comp, const Reach* r);
+
 uint64_t BonesMSHook(char* output, void* skeleton, char* out, uint32_t maxBones) {
     bool layers0 = g_layerCount.load(std::memory_order_relaxed) > 0, rec = g_recCount.load(std::memory_order_relaxed) > 0,
-         shaped = g_shapeCount.load(std::memory_order_relaxed) > 0;
-    if ((layers0 || rec || shaped) && output && out) {
+         shaped = g_shapeCount.load(std::memory_order_relaxed) > 0,
+         reaching = g_reachCount.load(std::memory_order_relaxed) > 0;
+    if ((layers0 || rec || shaped || reaching) && output && out) {
         char* comp = out - FieldOr("CAnimatedComponent.bonesMS", PoseOff(0xddc));
         if (layers0) {
             std::shared_ptr<const std::vector<PoseLayer>> layers;
@@ -2566,6 +2605,15 @@ uint64_t BonesMSHook(char* output, void* skeleton, char* out, uint32_t maxBones)
                 if (it != g_shapes.end()) shape = it->second;
             }
             if (shape) ApplyShapeGuarded(output, shape.get());
+        }
+        if (reaching) {
+            std::shared_ptr<const Reach> reach;
+            {
+                std::lock_guard<std::mutex> lk(g_reachMx);
+                auto it = g_reaches.find(comp);
+                if (it != g_reaches.end()) reach = it->second;
+            }
+            if (reach) ApplyReachGuarded(output, comp, reach.get());
         }
         if (rec) RecordFrameGuarded(comp, output);
     }
@@ -2592,6 +2640,182 @@ bool ToMatrixGuarded(ToMatrixQs_t f, const float* qs, float* out) {
     }
 }
 std::unordered_map<void*, GetBuf> g_sampleBufs;  // by component, under g_getMx
+
+// --- w3.anim.reach's arithmetic. Model matrices are the engine's (ToMatrix, row vectors: child = local x parent,
+// translation in the last row); a rotation built here is a column-vector 3x3 R, which turns a model matrix's rows
+// (its axes) as M' = M x R^T.
+struct V3 {
+    float x, y, z;
+};
+V3 operator-(V3 a, V3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
+V3 operator+(V3 a, V3 b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
+V3 operator*(V3 a, float k) { return {a.x * k, a.y * k, a.z * k}; }
+float Dot(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+V3 Cross(V3 a, V3 b) { return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; }
+float Len(V3 a) { return sqrtf(Dot(a, a)); }
+V3 Unit(V3 a) {
+    float l = Len(a);
+    return l > 1e-8f ? a * (1.0f / l) : V3{0, 0, 0};
+}
+float AngleBetween(V3 a, V3 b) {
+    float d = Dot(Unit(a), Unit(b));
+    return acosf(d < -1 ? -1 : d > 1 ? 1 : d);
+}
+void AxisAngle(V3 k, float ang, float R[9]) {  // column-vector rotation about unit k
+    float c = cosf(ang), s = sinf(ang), t = 1 - c;
+    R[0] = c + t * k.x * k.x;       R[1] = t * k.x * k.y - s * k.z; R[2] = t * k.x * k.z + s * k.y;
+    R[3] = t * k.x * k.y + s * k.z; R[4] = c + t * k.y * k.y;       R[5] = t * k.y * k.z - s * k.x;
+    R[6] = t * k.x * k.z - s * k.y; R[7] = t * k.y * k.z + s * k.x; R[8] = c + t * k.z * k.z;
+}
+V3 Apply(const float R[9], V3 v) {
+    return {R[0] * v.x + R[1] * v.y + R[2] * v.z, R[3] * v.x + R[4] * v.y + R[5] * v.z, R[6] * v.x + R[7] * v.y + R[8] * v.z};
+}
+void Rot3(const float* m16, float r[9]) {  // a model matrix's rotation rows, without scale
+    for (int i = 0; i < 3; ++i) {
+        V3 row = Unit({m16[i * 4], m16[i * 4 + 1], m16[i * 4 + 2]});
+        r[i * 3] = row.x, r[i * 3 + 1] = row.y, r[i * 3 + 2] = row.z;
+    }
+}
+void MulRowsByRT(const float M[9], const float R[9], float out[9]) {  // out = M x R^T
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            out[i * 3 + j] = M[i * 3] * R[j * 3] + M[i * 3 + 1] * R[j * 3 + 1] + M[i * 3 + 2] * R[j * 3 + 2];
+}
+void MulABT(const float A[9], const float B[9], float out[9]) {  // out = A x B^T (B a rotation: its inverse)
+    MulRowsByRT(A, B, out);
+}
+void QuatToStd(const float q[4], float R[9]) {  // the usual column-vector matrix of a quaternion xyzw
+    float x = q[0], y = q[1], z = q[2], w = q[3];
+    R[0] = 1 - 2 * (y * y + z * z); R[1] = 2 * (x * y - z * w);     R[2] = 2 * (x * z + y * w);
+    R[3] = 2 * (x * y + z * w);     R[4] = 1 - 2 * (x * x + z * z); R[5] = 2 * (y * z - x * w);
+    R[6] = 2 * (x * z - y * w);     R[7] = 2 * (y * z + x * w);     R[8] = 1 - 2 * (x * x + y * y);
+}
+void StdToQuat(const float R[9], float q[4]) {
+    float tr = R[0] + R[4] + R[8];
+    if (tr > 0) {
+        float s = sqrtf(tr + 1) * 2;
+        q[3] = 0.25f * s, q[0] = (R[7] - R[5]) / s, q[1] = (R[2] - R[6]) / s, q[2] = (R[3] - R[1]) / s;
+    } else if (R[0] > R[4] && R[0] > R[8]) {
+        float s = sqrtf(1 + R[0] - R[4] - R[8]) * 2;
+        q[3] = (R[7] - R[5]) / s, q[0] = 0.25f * s, q[1] = (R[1] + R[3]) / s, q[2] = (R[2] + R[6]) / s;
+    } else if (R[4] > R[8]) {
+        float s = sqrtf(1 + R[4] - R[0] - R[8]) * 2;
+        q[3] = (R[2] - R[6]) / s, q[0] = (R[1] + R[3]) / s, q[1] = 0.25f * s, q[2] = (R[5] + R[7]) / s;
+    } else {
+        float s = sqrtf(1 + R[8] - R[0] - R[4]) * 2;
+        q[3] = (R[3] - R[1]) / s, q[0] = (R[2] + R[6]) / s, q[1] = (R[5] + R[7]) / s, q[2] = 0.25f * s;
+    }
+}
+
+void ApplyReach(char* output, char* comp, const Reach& r) {
+    float* pose = nullptr;
+    uint32_t n = 0;
+    GRead(output, &pose, 8);
+    GRead(output + FieldOr("SBehaviorGraphOutput.numBones", 0x18), &n, 4);
+    const std::vector<int16_t>& par = *r.parents;
+    if (!pose || n == 0 || n > 512 || par.size() < n || r.weight <= 0) return;
+    int top = (std::max)({r.upper, r.mid, r.end, r.mid1, r.mid3, r.index1, r.pinky1});
+    if (static_cast<uint32_t>(top) >= n) return;
+    auto toMatrix = reinterpret_cast<ToMatrixQs_t>(Address("EngineQsTransform::ToMatrix"));
+    void* entity = nullptr;
+    float m2w[16];
+    if (!toMatrix || !GRead(comp + 0x30, &entity, 8) || !entity || !GRead(static_cast<char*>(entity) + 0x70, m2w, 64)) return;
+    // the model matrices up to the last bone needed (a parent comes before its child)
+    std::vector<float> model(static_cast<size_t>(top + 1) * 16), local(static_cast<size_t>(top + 1) * 16);
+    for (int b = 0; b <= top; ++b) {
+        float* L = local.data() + static_cast<size_t>(b) * 16;
+        if (!ToMatrixGuarded(toMatrix, pose + static_cast<size_t>(b) * 12, L)) return;
+        int p = par[b];
+        float* dst = model.data() + static_cast<size_t>(b) * 16;
+        if (p >= 0 && p < b) Mul(L, model.data() + static_cast<size_t>(p) * 16, dst);
+        else memcpy(dst, L, 64);
+    }
+    auto pos = [&](int b) {
+        const float* m = model.data() + static_cast<size_t>(b) * 16;
+        return V3{m[12], m[13], m[14]};
+    };
+    // the target in model space (m2w: model X, Y, Z axes in its first three rows, the place in the last)
+    V3 tw{r.target[0] - m2w[12], r.target[1] - m2w[13], r.target[2] - m2w[14]};
+    V3 ax{m2w[0], m2w[1], m2w[2]}, ay{m2w[4], m2w[5], m2w[6]}, az{m2w[8], m2w[9], m2w[10]};
+    V3 T{Dot(tw, ax) / Dot(ax, ax), Dot(tw, ay) / Dot(ay, ay), Dot(tw, az) / Dot(az, az)};
+    // the grip point
+    V3 H = pos(r.end), F = Unit(pos(r.mid1) - H), S = Unit(pos(r.index1) - pos(r.pinky1));
+    V3 N = Unit(Cross(F, S));
+    if (Dot(N, pos(r.mid3) - pos(r.mid1)) < 0) N = N * -1.0f;
+    V3 A = pos(r.upper), B = pos(r.mid), C = H + F * r.ahead + N * r.out;
+    float a = Len(B - A), b = Len(C - B);
+    if (a < 1e-4f || b < 1e-4f) return;
+    float c = Len(T - A), lo = fabsf(a - b) + 1e-3f, hi = a + b - 1e-3f;
+    c = c < lo ? lo : c > hi ? hi : c;
+    float w = r.weight > 1 ? 1 : r.weight;
+    // 1: the elbow to the right angle
+    float R1[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+    V3 u = A - B, v = C - B, k = Cross(u, v);
+    if (Len(k) > 1e-6f) {
+        float cosB = (a * a + b * b - c * c) / (2 * a * b);
+        float want = acosf(cosB < -1 ? -1 : cosB > 1 ? 1 : cosB), now = AngleBetween(u, v);
+        AxisAngle(Unit(k), (want - now) * w, R1);
+    }
+    V3 C1 = B + Apply(R1, C - B);
+    // 2: the upper arm onto the target
+    float R2[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+    V3 d1 = C1 - A, d2 = T - A, k2 = Cross(d1, d2);
+    if (Len(k2) > 1e-6f) AxisAngle(Unit(k2), AngleBetween(d1, d2) * w, R2);
+    // the new local turns: the forearm's in the old upper arm's frame, the upper arm's in its parent's
+    float Mmid[9], Mup[9], Mpar[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1}, t[9], Lmid[9], Lup[9];
+    Rot3(model.data() + static_cast<size_t>(r.mid) * 16, Mmid);
+    Rot3(model.data() + static_cast<size_t>(r.upper) * 16, Mup);
+    if (par[r.upper] >= 0) Rot3(model.data() + static_cast<size_t>(par[r.upper]) * 16, Mpar);
+    MulRowsByRT(Mmid, R1, t);
+    MulABT(t, Mup, Lmid);
+    MulRowsByRT(Mup, R2, t);
+    MulABT(t, Mpar, Lup);
+    // the engine's quaternion of a local matrix: its ToMatrix gives the usual matrix or its transpose. Decided once,
+    // on the most turned bone of the chain's way (a turn near zero looks the same either way)
+    if (g_reachTransposed.load() < 0) {
+        float best = 0;
+        int pick = -1;
+        for (int b = 0; b <= top; ++b) {
+            float R[9];
+            QuatToStd(pose + static_cast<size_t>(b) * 12 + 4, R);
+            float asym = fabsf(R[1] - R[3]) + fabsf(R[2] - R[6]) + fabsf(R[5] - R[7]);
+            if (asym > best) best = asym, pick = b;
+        }
+        if (pick < 0 || best < 0.3f) return;
+        float Rstd[9], Eng[9];
+        QuatToStd(pose + static_cast<size_t>(pick) * 12 + 4, Rstd);
+        Rot3(local.data() + static_cast<size_t>(pick) * 16, Eng);
+        float same = 0, trans = 0;
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j) same += fabsf(Eng[i * 3 + j] - Rstd[i * 3 + j]), trans += fabsf(Eng[i * 3 + j] - Rstd[j * 3 + i]);
+        g_reachTransposed = trans < same ? 1 : 0;
+        Log("posehook: reach - the engine's rotation matrix is the %s one (bone %d, off %.3f / %.3f)", trans < same ? "transposed" : "usual", pick, same, trans);
+    }
+    auto write = [&](int bone, const float L[9]) {
+        float* q = pose + static_cast<size_t>(bone) * 12 + 4;
+        float nq[4];
+        bool transposed = g_reachTransposed.load() == 1;
+        float M[9];
+        if (transposed)
+            for (int i = 0; i < 3; ++i)
+                for (int j = 0; j < 3; ++j) M[i * 3 + j] = L[j * 3 + i];
+        else
+            memcpy(M, L, sizeof M);
+        StdToQuat(M, nq);
+        float len = sqrtf(nq[0] * nq[0] + nq[1] * nq[1] + nq[2] * nq[2] + nq[3] * nq[3]);
+        if (len < 1e-6f) return;
+        float sgn = (nq[0] * q[0] + nq[1] * q[1] + nq[2] * q[2] + nq[3] * q[3]) < 0 ? -1.0f : 1.0f;
+        for (int k2i = 0; k2i < 4; ++k2i) q[k2i] = nq[k2i] / len * sgn;
+    };
+    write(r.mid, Lmid);
+    write(r.upper, Lup);
+}
+void ApplyReachGuarded(char* output, char* comp, const Reach* r) {
+    __try {
+        ApplyReach(output, comp, *r);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
 }  // namespace
 
 // w3.anim.sample (lua.cpp): animation `name` of the component's sets at second t, in the component's model space like
@@ -2766,6 +2990,68 @@ std::string AnimShapeSet(void* comp, const std::vector<std::pair<std::string, st
     if (list->bones.empty()) g_shapes.erase(comp);
     else g_shapes[comp] = std::move(list);
     g_shapeCount.store(static_cast<int>(g_shapes.size()));
+    return "";
+}
+
+// w3.anim.reach: hand 'l' or 'r' reaches target (world) with weight (0 or no hand: off); ahead and out place the grip
+// point in the hand (metres). Main thread. A second call for the same hand only moves the target and the weight.
+std::string AnimReachSet(void* comp, char hand, const float* target, float weight, float ahead, float out) {
+    FindSkelOffsets();
+    if (!comp || !IsScriptable(comp) || !DerivesFromGuarded(comp, "CAnimatedComponent"))
+        return "an animated figure or component is needed";
+    if (hand != 'l' && hand != 'r') {
+        std::lock_guard<std::mutex> lk(g_reachMx);
+        g_reaches.erase(comp);
+        g_reachCount.store(static_cast<int>(g_reaches.size()));
+        return "";
+    }
+    std::shared_ptr<const Reach> was;
+    {
+        std::lock_guard<std::mutex> lk(g_reachMx);
+        auto it = g_reaches.find(comp);
+        if (it != g_reaches.end() && it->second->hand == hand) was = it->second;
+    }
+    auto r = std::make_shared<Reach>();
+    if (was) {
+        *r = *was;
+    } else {
+        void* skel = SkeletonPtr(comp);
+        std::vector<std::string> rig;
+        std::vector<float> rest;
+        std::string e = RigOf(skel, &rig, &rest);
+        if (!e.empty()) return e;
+        auto find = [&](const char* name, int* at) {
+            std::string full = std::string(1, hand) + "_" + name;
+            auto it = std::find(rig.begin(), rig.end(), full);
+            *at = it == rig.end() ? -1 : static_cast<int>(it - rig.begin());
+            return *at >= 0;
+        };
+        r->hand = hand;
+        if (!find("bicep", &r->upper) || !find("forearm", &r->mid) || !find("hand", &r->end) ||
+            !find("middle1", &r->mid1) || !find("middle3", &r->mid3) || !find("index1", &r->index1) ||
+            !find("pinky1", &r->pinky1))
+            return "the rig lacks an arm's bones (bicep, forearm, hand, middle1, middle3, index1, pinky1)";
+        uint32_t n = 0;
+        const int16_t* par = nullptr;
+        GRead(static_cast<char*>(skel) + FieldOr("CSkeleton.boneCount", 0x70), &n, 4);
+        GRead(static_cast<char*>(skel) + 0x80, &par, 8);
+        if (!par || n == 0 || n > 512 || n < rig.size()) return "the figure's skeleton could not be read";
+        auto parents = std::make_shared<std::vector<int16_t>>(n);
+        if (!GRead(par, parents->data(), static_cast<size_t>(n) * 2)) return "the figure's skeleton could not be read";
+        if ((*parents)[r->end] != r->mid || (*parents)[r->mid] != r->upper)
+            return "the arm is no chain bicep - forearm - hand in this rig";
+        r->parents = parents;
+        std::string e2 = EnsureBonesHook();
+        if (!e2.empty()) return e2;
+    }
+    memcpy(r->target, target, 12);
+    r->weight = weight;
+    r->ahead = ahead;
+    r->out = out;
+    std::lock_guard<std::mutex> lk(g_reachMx);
+    if (weight <= 0) g_reaches.erase(comp);
+    else g_reaches[comp] = std::move(r);
+    g_reachCount.store(static_cast<int>(g_reaches.size()));
     return "";
 }
 

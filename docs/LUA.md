@@ -364,6 +364,17 @@ An engine function has one of these names:
 w3.engine_addr("CEntity::vf140")     -- the function's offset in witcher3.exe, or nil and why
 ```
 
+`w3.patch(place, bytes [, offset])` writes bytes into the game's code or data and returns a handle, or nil and the
+reason. `place` is an engine name as above, an offset in witcher3.exe, an address, or a signature that matches
+exactly once (`"48 8B ?? 05"`, `??` for any byte). `bytes` is hex text or a table of numbers. `w3.unpatch(handle)`
+puts the old bytes back. When your mod is taken out, its patches go back too. Two patches over the same bytes are
+refused. `w3.find_code(signature [, max])` lists every match of a signature in the code.
+
+```lua
+local h = assert(w3.patch("40 53 57 41 56 41 57 48 83 EC 48", "90 90", 0))
+w3.unpatch(h)
+```
+
 `w3.engine_call(fn, sig, ...)` calls an engine function. `fn` is a name as above or an offset (as `w3.vslot` and
 `w3.engine_addr` give it). `sig` has one letter for each argument, then `>` and the letter of the result:
 
@@ -779,6 +790,11 @@ keeps the values it was made with until `w3.material.apply(entity)` draws its me
 second time, with its own material instances, so `w3.material.set` on them changes this entity only (a skin colour
 for one figure). It returns how many meshes became its own. HairWorks fur (`CFurComponent`) keeps the shared ones.
 
+`w3.material.assign(component, index, material)` puts another material into one material slot of a mesh component
+(from 1). `material` is a material object (`w3.material.of` of another entity, for example) or its depot path
+(`.w2mi`). The component gets a mesh of its own first, so the other entities with that mesh keep theirs; the material
+shows a few frames later. It returns true, or nil and the reason (for HairWorks fur, which keeps the shared mesh).
+
 `w3.refresh(component)` draws one component anew from its current data. It returns false for a component outside
 the world.
 
@@ -898,6 +914,10 @@ gives its faces back to the game.
 
 `w3.figure.head(name)` gives Geralt one of the barber's heads (`"head_0"` is clean-shaven); `w3.figure.head_reset()`
 brings his own back. `w3.figure.furs(entity)` lists the entity's HairWorks hair and fur components.
+
+`w3.cloth.of(entity)` lists the cloth of a figure and of its mounted items (capes, skirts, the tabs of an armour).
+`w3.cloth.simulate(cloth, false)` lets it follow the skeleton only, `w3.cloth.freeze(cloth, true)` holds it where
+it is, `w3.cloth.reach(cloth, scale)` sets how far it may swing away from the body (0 to 1).
 
 ```lua
 local fur = w3.figure.furs(wolf)[1]
@@ -1062,6 +1082,20 @@ end
 print(table.concat(w3.anim.bones(face), ", "))
 w3.anim.shape(face, {nose = {scale = 1.2}, chin = {offset = {0, 0.01, 0}}, left_eye = {scale = 1.1}, right_eye = {scale = 1.1}})
 ```
+
+### Reaching a point
+
+```lua
+w3.anim.reach(w3.player(), {hand = "r", target = cup_pos, weight = 1})   -- the right hand to the cup, every frame
+w3.anim.reach(w3.player(), nil)                                          -- off
+```
+
+`w3.anim.reach(actor, opts)` turns the upper arm and the forearm so the hand reaches `target`, a point in the world,
+on top of whatever animation plays. `hand` is `"l"` or `"r"`. The grip point is `ahead` metres from the wrist toward
+the middle finger (0.10) and `out` metres out of the palm (0.05); that point lands on the target. The elbow bends in
+the plane the animation gives it. `weight` from 0 to 1 blends from the animation's arm to the reaching one: a
+function on `w3.on_tick` can raise it toward a grab and lower it after. A second call moves the target and the weight.
+A target out of reach gets the stretched arm pointing at it.
 
 ### Recording
 
@@ -1246,6 +1280,66 @@ Each has its `mesh` path, `origin`, `axes`, `rot` (`{Pitch, Yaw, Roll}`) and `sc
 `"volume"` for weather and sound volumes. `group` is the layer a mesh came from: the parts of one building share it.
 The first call reads the tables of the game's bundles to name the meshes (about 0.2 s). `w3.world.path_hash(path)`
 gives the hash a mesh has in the merged data.
+
+### Objects around a point
+
+```lua
+for _, o in ipairs(w3.world.objects(w3.player():GetWorldPosition(), 5)) do
+    print(o.id, o.kind, o.mesh, o.distance, o.loaded)   -- world:417063 mesh environment\...\very_rich_bed_b.w2mesh
+end
+local bed = w3.world.object("world:417063")           -- the same object again by its id
+local hit = w3.world.pick(from, to)                    -- the object a ray hits first
+```
+
+`w3.world.objects(pos, radius)` lists the merged meshes and the entities around a point, nearest first. Each has an
+`id` that stays the same after a load and while the world streams:
+
+- `world:<index>`: a merged mesh of the world (houses, walls, furniture)
+- `<layer path>:<index>`: a merged mesh of a layer with merged data of its own (a quest's, a DLC's)
+- `entity:<guid>`: an entity placed in a layer
+- `entity@<address>`: an entity the game or a mod spawned (it has no GUID; the id is good while the entity lives)
+
+A merged mesh has the fields of `w3.world.merged` and `loaded` (the world shows it right now). An entity has
+`entity`, `class`, `template`, `tags`, `pos`, `rot`, its box in the world (`min`, `max`) and `meshes` (`{component,
+mesh}` for each mesh of it; `mesh` is the first one's path). `{kinds = {"mesh", "entity"}}` picks the kinds, also
+`"proxy"` and `"volume"`; `max` limits the entities (500).
+
+`w3.world.object(id)` gives one object by its id, `nil` for an entity that is gone. `w3.world.pick(from, to)` gives
+the object a ray hits first, with `hit` (the point) and `normal`. On merged meshes it is the smallest one whose box
+holds the point. A ray onto the terrain or onto geometry without a mesh gives `{kind = "terrain"}` or
+`{kind = "world"}`.
+
+```lua
+w3.world.unstream("world:417063")    -- the bed is gone the next frame, its collision with it
+w3.world.restream("world:417063")    -- back within a second or two
+```
+
+`w3.world.unstream(id)` takes a merged mesh of the world (`world:<index>`, or its object) out of the world, with its
+collision. It stays out while the world streams, until `w3.world.restream(id)` or the next load.
+`w3.world.unstreamed(id)` says whether it is out. Both give `true`, or `nil` and the reason. Merged meshes of a layer
+with merged data of its own stay where they are: for those, `w3.world.sector_hide`.
+
+### Outlines in the Witcher senses
+
+```lua
+local h = w3.highlight.add("world:417063", {color = 0xFFFF4FB4})   -- the bed outlined in pink
+local h2 = w3.highlight.add(npc)                                    -- an entity, in the game's red
+w3.highlight.remove(h)                                              -- clear() takes every outline away
+```
+
+`w3.highlight.add(target, opts)` outlines an object in the Witcher senses. `target` is an id or an object of
+`w3.world.objects`, an entity or one of its components. Merged meshes of layers with merged data of their own are
+left out. The outline stays while the world streams and while the entity changes its look.
+
+`color` (`0xAARRGGBB`, or `{r, g, b, a}` from 0 to 1) gives the outline a colour of your own. The game's red and
+yellow outlines stay as they are. One colour of your own shows at a time: an outline in a second colour raises an
+error until the outlines of the first are removed. TW3SE brings the shader for the colour of your own,
+`tw3se\shaders\ec02b0473a2af8a4.cso` (the game's outline shader with a channel for it). With a mod that replaces the outline shader (CWSO), the colour of your own stays off.
+
+`group` puts the outline into one of the game's two colours: `"clue"` (red, the game's clues; the default) or
+`"interactive"` (yellow, doors and chests). With `color` as well, that group turns to the colour while one of your
+outlines uses it, the game's own objects of the group with it. When the shader file is missing, `color` alone
+turns the red group. `w3.highlight.list()` gives your outlines (`{handle = id}`).
 
 ```lua
 local wall = w3.world.place([[environment\architecture\human\common\cellar\cellar_mod_wall_flat.w2mesh]], pos, 90)

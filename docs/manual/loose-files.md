@@ -45,6 +45,32 @@ python tools\texcache.py info "<game>\content\content0\texture.cache" wraith
 python tools\texcache.py dds "<game>\content\content0\texture.cache" characters\models\monsters\wraith\model\t_01__wraith_d01.xbm wraith.dds
 ```
 
+### Textures of your own
+
+A DDS under a path the game has no texture for is a new texture. It needs an `.xbm` beside it, which
+`tools\new_texture.py` makes from a game texture of the same format. The tool also copies the DDS beside the `.xbm`:
+
+```
+python tools\new_texture.py characters\models\main_npc\ciri\h_01_wa__ciri\h_01_wa__ciri_d01.xbm mymod\skin\head_tan_d01.xbm head_tan.dds
+```
+
+A material takes it like any texture of the game, at the next start:
+
+```lua
+w3.material.set(mi, "Diffuse", w3.load([[mymod\skin\head_tan_d01.xbm]]))
+```
+
+Its size and mip count are the DDS's own. The `.xbm` holds the key TW3SE files the pixels under (FNV-1a 32 of its
+path in lower case), so it belongs to its path: for another path, run the tool again.
+
+The `.xbm` also holds the texture's smallest mips (32 x 32 and below), taken from the DDS. The game shows them until it
+has streamed the larger ones, so the texture has its own colours from the first frame. An `.xbm` made with an older
+version of the tool holds the game texture's small mips; `--embed` takes them from the DDS beside it:
+
+```
+python tools\new_texture.py --embed mymod\skin\head_tan_d01.xbm
+```
+
 ## Sounds
 
 A Wwise bank (`.bnk`) or streamed sound (`.wem`) anywhere under `tw3se\files\` replaces the game's sound file of that
