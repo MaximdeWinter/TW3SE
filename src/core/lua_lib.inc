@@ -544,6 +544,11 @@ function w3.material.assign(c, index, material)
     return w3._refresh(x)
   end
   local st = own_state[key]
+  -- (an entity made anew at the same address, after a world change: its component has no copy yet)
+  if st and not w3.valid(st.ent) then
+    own_state[key] = nil
+    st = nil
+  end
   if st and st.ready then return put(index, material) end
   if st then
     st.pending[#st.pending + 1] = {index, material}
@@ -551,7 +556,7 @@ function w3.material.assign(c, index, material)
   end
   local ok, err = pcall(w3.deform.own, c)
   if not ok then return nil, "the component gets no mesh of its own: " .. tostring(err) end
-  st = {ready = false, pending = {{index, material}}}
+  st = {ready = false, pending = {{index, material}}, ent = ent}
   own_state[key] = st
   w3.run(function()
     w3.wait_frames(2)
@@ -787,7 +792,25 @@ end
 -- knows its render mesh by address only: after the free it read the old values from the freed memory, took the mesh
 -- for alive and wrote the mesh's box into it at each weight change (a crash minutes later, with figures that hold
 -- copies with weights set every tick). w3.deform._watch = false turns the check off (for a test).
-local owned = {}  -- address of the component -> its shared mesh
+local owned = {}  -- address of the component -> {its shared mesh, the copy it draws}
+-- (an entry holds while the component at that address still draws the copy: a component made anew there - the new
+-- player's parts lay at the old parts' addresses after a world change, an appearance makes a head anew in its entity -
+-- draws another mesh. Address alone: own() gave them no copy and release() set the old world's freed mesh into them,
+-- 27.11. Not the component's handle: a refresh gives it a new one, own() made a copy of the copy, her torso lost its
+-- skin tone. Not the entity: it lives on while a part of it is made anew)
+local function draws(c, copy)
+  local ok, cur = pcall(function() return c.mesh end)
+  return ok and cur ~= nil and w3.addr(cur) == w3.addr(copy)
+end
+local function owner(c)
+  local key = w3.addr(c)
+  local o = owned[key]
+  if o and not draws(c, o[2]) then
+    owned[key] = nil
+    o = nil
+  end
+  return key, o
+end
 local watched, watchTick = {}, nil  -- render mesh address of an own copy with sets -> {component, its address}
 w3.deform._watch = true
 local function watch_copy(c, rm)
@@ -826,7 +849,7 @@ end
 function w3.deform.load(c, path, range)  -- a set from tw3se\<path>; range = the largest |weight| planned (1)
   local rm = render_mesh(c)
   local set, err = w3._bs_load(rm, path, range)
-  if set and w3.classof(c) ~= "CMesh" and owned[w3.addr(c)] then watch_copy(c, rm) end
+  if set and w3.classof(c) ~= "CMesh" and select(2, owner(c)) then watch_copy(c, rm) end
   return set, err
 end
 w3.deform.set = w3._bs_set                -- (set, shape name or index, weight)
@@ -840,13 +863,14 @@ w3.deform.normals = w3._bs_normals        -- (set or live mesh, true): normals f
 function w3.deform.dump(c, path, now)     -- the mesh's base positions and normals per chunk to tw3se\<path> (TWDB)
   return w3._bs_dump(render_mesh(c), path, now)  -- now: as moved, with a set loaded
 end
+)TW3SELIB" R"TW3SELIB(
 -- A mesh of its own for one component, so a set changes this entity only: the mesh file under a second path (a new
 -- one per call), loaded as a mesh of its own and set into the component. Its render mesh is there a few ticks later
 -- (w3.deform.loaded). release() gives the component the shared mesh back.
 function w3.deform.own(c)
   local m = c.mesh or error("the component has no mesh", 2)
-  local key = w3.addr(c)
-  if owned[key] then return m end
+  local key, o = owner(c)
+  if o then return m end
   local src = m:GetPath()
   local stem = src:match("^(.*)%.w2mesh$") or error("not a .w2mesh: " .. src, 2)
   local n, path, ok, err = 0
@@ -859,18 +883,17 @@ function w3.deform.own(c)
   until ok or not err:find("hash", 1, true) or n > 1000  -- (a name whose hash is taken: the next number)
   if not ok then error(err, 2) end
   local copy = w3.load(path) or error("the copy did not load: " .. path, 2)
-  owned[key] = m
+  owned[key] = {m, copy}
   w3.set_mesh(c, copy)
   return copy
 end
 function w3.deform.release(c)  -- the shared mesh back; false if the component had none of its own
-  local key = w3.addr(c)
-  local m = owned[key]
-  if not m then return false end
+  local key, o = owner(c)
+  if not o then return false end
   owned[key] = nil
   local ok, rm = pcall(render_mesh, c)  -- the copy's sets end here, without a write into the copy going away
   if ok then w3._bs_forget(rm) end
-  w3.set_mesh(c, m)
+  if w3.valid(o[1]) then w3.set_mesh(c, o[1]) end
   return true
 end
 function w3.deform.loaded(c) return (pcall(render_mesh, c)) end
@@ -888,7 +911,7 @@ function w3.deform.hide(c, bits)
     id, err = w3._hide_open(rm)
     if not id then return nil, err end
     hides[rm] = id
-    if w3.classof(c) ~= "CMesh" and owned[w3.addr(c)] then watch_copy(c, rm) end
+    if w3.classof(c) ~= "CMesh" and select(2, owner(c)) then watch_copy(c, rm) end
   end
   for chunk, b in pairs(bits) do
     local ok, err = w3._hide_bits(id, chunk, b)
@@ -939,6 +962,17 @@ function w3.deform.hide_union(...)
   end
   return out
 end
+
+-- Textures: the pixels of a loaded texture from a DDS while the game runs. The DDS has the texture's size and its
+-- block format (BC1 for most diffuse maps); its levels go block for block into the texture, from the next frame on,
+-- and again whenever the streaming loads the texture anew. Every object with that texture shows it.
+w3.texture = w3.texture or {}
+function w3.texture.write(path, dds) return w3._tex_pin(path, dds) end  -- true | nil, why
+function w3.texture.release(path) return w3._tex_unpin(path) end        -- the streaming brings the game's back
+-- tattoos and scars on a pinned BC1 texture: w3.texture.stamp(path, position map file, {layer, ...}), each layer
+-- {motif = file, x, y, z, nx, ny, nz, size, turn, opacity, flip, ink = {r, g, b}}; every call composes them all anew
+function w3.texture.stamp(path, posmap, layers) return w3._tex_stamp(path, posmap, layers) end
+function w3.texture.eye(path, layers, look) return w3._tex_eye(path, layers, look) end
 -- fn(count) after TW3SE ended every set because the game rebuilds its render resources (a graphics option applied
 -- through the options, path tracing among them): load the sets again (w3.deform.state gives "none" for the old ones)
 w3.deform._reset_fns = {}

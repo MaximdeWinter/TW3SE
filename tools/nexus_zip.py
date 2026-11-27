@@ -6,7 +6,7 @@
                               the only thing a hand unpack puts in the game's root
     TW3SE-SDK-<version>.zip   for plugin authors: headers, the two example plugins, the manual
 
-    python tools/nexus_zip.py            -> build\\nexus\\<version>\\ (+ a .sha256 per zip)
+    python tools/nexus_zip.py            -> releases\\<version>\\ (+ a .sha256 per zip)
 """
 import hashlib
 import os
@@ -25,7 +25,7 @@ def version():
     return ".".join(parts)
 
 
-OUT = os.path.join(ROOT, "build", "nexus", version())   # one folder per version: zips, .sha256, VirusTotal, test log
+OUT = os.path.join(ROOT, "releases", version())   # one folder per version: zips, .sha256, VirusTotal, symbols, test log
 
 
 def add_tree(z, src, dst):

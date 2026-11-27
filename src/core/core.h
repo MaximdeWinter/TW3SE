@@ -436,6 +436,10 @@ std::string SceneSeek(void* player, float t);
 struct SceneElement { int index; float start, duration, local; bool running; };
 std::string SceneElements(void* player, std::vector<SceneElement>* out, int* current);
 void* VtableOfType(const char* typeName);  // a class's vtable by its RTTI name (".?AVCRenderCommand_X@@"), or null
+// blendshape.cpp: a reference of TW3SE's on a render object (a render mesh, a render texture) given back the engine's
+// way, on the render thread (CRenderCommand_ReleaseRenderObjectOnRenderThread); false when that is not there (then
+// the caller's own release is the only way left)
+bool ReleaseOnRenderThread(void* renderObject);
 // --- decal.cpp: dynamic decals (the renderer's CRenderDynamicDecal, docs/FINDINGS_DECAL.md)
 struct DecalDesc {
     float pos[3], dir[3], up[3];      // centre, projection direction, up of the picture in its plane
@@ -522,6 +526,32 @@ bool LiveBounds(int id, const float* mn, const float* mx);  // any thread
 // texwrite.cpp: pixels into a loaded texture; TexProbe measures where its D3D12 resource is
 std::string TexProbe(const char* depotPath, const std::wstring& outFile);
 bool TextureWrite(const char* depotPath, const void* rgba8, int w, int h, int mips, std::string* err);  // main thread
+bool TexturePin(const char* depotPath, const std::wstring& ddsFile, std::string* err);  // w3.texture.write, main thread
+bool TextureUnpin(const char* depotPath);                                                // w3.texture.release
+void UiFrameTimes(uint64_t* frames, uint64_t* us, uint64_t* publishUs, bool reset);  // ui.cpp, overlaystats
+void InstallStreamlineWatch();      // slui.cpp: the game's Streamline tags watched (overlay start)
+std::string StreamlineTagStats();  // slui.cpp: what the game tagged, by type
+// w3.texture.stamp: tattoos and scars on a pinned BC1 texture, through a position map (texwrite.cpp)
+struct TexStampLayer {
+    std::wstring motif;                       // TWMO: rgb the colour ratio * 128, a the cover
+    float centre[3], normal[3], up[3], right[3];  // model space, m
+    float size = 0.1f, depth = 0.04f, opacity = 1.0f;
+    float facing = 0.15f;                     // texels whose normal turns further from the stamp's are left out
+    bool flip = false, tint = false;
+    float colour[3] = {1, 1, 1};              // with tint: the ink's own colour (0..1), the motif's alpha its amount
+};
+bool TextureStamp(const char* depotPath, const std::wstring& posmap, const std::vector<TexStampLayer>& layers,
+                  std::string* err);
+// w3.texture.eye: an eye texture mixed from layers (TWEY) and pinned on the texture (texwrite.cpp)
+struct TexEyeLook {
+    bool cat = false;                                 // a cat's slit and iris, else round
+    float veins = 0.35f;                              // 0 none, 0.35 a usual eye's, 1 bloodshot
+    float white[3] = {240 / 255.0f, 236 / 255.0f, 232 / 255.0f};
+    float vein[3] = {0.59f, 0.12f, 0.12f};
+    float outer[3] = {0.47f, 0.67f, 0.82f}, inner[3] = {0.78f, 0.88f, 0.94f};
+    float pupil[3] = {0.03f, 0.03f, 0.04f};
+};
+bool TextureEye(const char* depotPath, const std::wstring& layers, const TexEyeLook& look, std::string* err);
 bool TexWritesPending();  // blendshape.cpp's SubmitWork: TexRecord records the finished writes into its list
 bool TexRecord(void* list, void* device, std::vector<IUnknown*>* keep);  // an ID3D12GraphicsCommandList, an ID3D12Device
 std::string TexStats();

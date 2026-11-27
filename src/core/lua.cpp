@@ -75,6 +75,38 @@ struct Obj {
     bool isStruct;  // a struct view: fields at ptr + offset, no script-data redirect, no methods
     void* block;    // the handle block {refs, flags, object} the object came through, or null (needed to pass it)
     bool owns;      // holds one reference on block, given back when Lua collects the value
+    void* ownerBlock;  // a struct view: the object it lies in, alive while this block still points at ownerPtr
+    void* ownerPtr;
+};
+// The object a view (a struct or an array inside it) lies in, set while its field or element is pushed. A view
+// checks it at each use: written through a view of a gone object, the handle went into memory that was another's by
+// then - an 8-byte pointer in the middle of PhysX's data, the game fell at a world's start minutes later (27.11.).
+struct ViewOwner {
+    void* block;
+    void* ptr;
+};
+thread_local ViewOwner g_viewOwner{};
+bool OwnerGone(void* block, void* ptr) {
+    void* now = nullptr;
+    return block && (!SafeRead(static_cast<char*>(block) + 0x08, &now, 8) || now != ptr);
+}
+// A view of a gone object used: the error, and the first 20 into tw3se.log with the Lua stack (most such calls run
+// under pcall, which swallows the error - the log names the line that would have written into another's memory)
+[[noreturn]] void ViewGone(lua_State* L, const std::string& what) {
+    static int logged = 0;
+    if (logged < 20) {
+        ++logged;
+        luaL_traceback(L, L, what.c_str(), 1);
+        Log("lua: %s (mod %s)", lua_tostring(L, -1), CurrentLuaMod()[0] ? CurrentLuaMod() : "-");
+        lua_pop(L, 1);
+    }
+    luaL_error(L, "%s", what.c_str());
+    for (;;) {}
+}
+struct OwnerScope {  // the owner for the views pushed in this scope
+    ViewOwner was;
+    explicit OwnerScope(ViewOwner now) : was(g_viewOwner) { g_viewOwner = now; }
+    ~OwnerScope() { g_viewOwner = was; }
 };
 
 template <class T> T Rd(const void* base, size_t off, T def = T()) {
@@ -253,6 +285,7 @@ void PushObject(lua_State* L, void* ptr, void* cls, bool isStruct, void* block =
     if (block && Rd<void*>(block, 0x08) != ptr) block = nullptr;  // a block of another (or a gone) object
     auto o = static_cast<Obj*>(lua_newuserdatauv(L, sizeof(Obj), 0));
     *o = {ptr, cls, isStruct, block, false};
+    if (isStruct) o->ownerBlock = g_viewOwner.block, o->ownerPtr = g_viewOwner.ptr;
     if (block && !isStruct) {
         InterlockedIncrement(static_cast<volatile LONG*>(block));
         o->owns = true;
@@ -295,6 +328,8 @@ struct Arr {
     void* inner;     // element type
     void* type;      // the array type itself
     uint32_t fixed;  // a fixed array ([N]Type): N elements right at addr, no count field; 0 for a TDynArray
+    void* ownerBlock;  // the object it lies in (g_viewOwner)
+    void* ownerPtr;
 };
 uint32_t ArrCount(const Arr* a) { return a->fixed ? a->fixed : Rd<uint32_t>(a->addr, 8); }
 char* ArrData(const Arr* a) { return a->fixed ? static_cast<char*>(a->addr) : Rd<char*>(a->addr, 0); }
@@ -321,14 +356,14 @@ void PushArrayCopy(lua_State* L, const void* addr, void* inner, int depth, bool 
 // a:to_table() snapshots it. Growing/shrinking (insert/remove) needs the engine allocator and is not here yet.
 void PushArrayView(lua_State* L, const void* addr, void* inner, void* type) {
     auto a = static_cast<Arr*>(lua_newuserdatauv(L, sizeof(Arr), 0));
-    *a = {const_cast<void*>(addr), inner, type, 0};
+    *a = {const_cast<void*>(addr), inner, type, 0, g_viewOwner.block, g_viewOwner.ptr};
     luaL_setmetatable(L, kArr);
 }
 
 // A fixed array ([N]Type): N elements one after the other, read and written in place.
 void PushFixedArrayView(lua_State* L, const void* addr, void* inner, uint32_t n) {
     auto a = static_cast<Arr*>(lua_newuserdatauv(L, sizeof(Arr), 0));
-    *a = {const_cast<void*>(addr), inner, nullptr, n};
+    *a = {const_cast<void*>(addr), inner, nullptr, n, g_viewOwner.block, g_viewOwner.ptr};
     luaL_setmetatable(L, kArr);
 }
 
@@ -1529,7 +1564,14 @@ Obj* CheckLive(lua_State* L, int idx) {
     Obj* o = CheckObj(L, idx);
     if (o->owns && Rd<void*>(o->block, 0x08) != o->ptr)
         luaL_error(L, "the %s is gone (destroyed in the game; w3.valid tells before use)", RttiName(o->cls).c_str());
+    if (o->isStruct && OwnerGone(o->ownerBlock, o->ownerPtr))
+        ViewGone(L, "the object this " + RttiName(o->cls) + " lies in is gone (fetch it anew from a live object)");
     return o;
+}
+// the owner of the views pushed from a field of o: o itself, or the object a struct view lies in
+ViewOwner OwnerOf(const Obj* o) {
+    if (o->isStruct) return {o->ownerBlock, o->ownerPtr};
+    return o->owns ? ViewOwner{o->block, o->ptr} : ViewOwner{};
 }
 
 // w3.discard(obj): an object w3.new made goes at the next tick, not when Lua's collector gets to the value.
@@ -1590,6 +1632,7 @@ int LIndex(lua_State* L) {
     if (void* prop = FindProp(o->cls, key)) {
         void* addr = FieldAddr(*o, prop);
         if (!addr) return 0;
+        OwnerScope scope(OwnerOf(o));
         PushValue(L, addr, Rd<void*>(prop, 0x08));
         return 1;
     }
@@ -1626,7 +1669,11 @@ int LEq(lua_State* L) {
 
 // --- array views
 
-Arr* CheckArr(lua_State* L, int idx) { return static_cast<Arr*>(luaL_checkudata(L, idx, kArr)); }
+Arr* CheckArr(lua_State* L, int idx) {
+    auto a = static_cast<Arr*>(luaL_checkudata(L, idx, kArr));
+    if (OwnerGone(a->ownerBlock, a->ownerPtr)) ViewGone(L, "the object this array lies in is gone (fetch it anew)");
+    return a;
+}
 
 int LArrLen(lua_State* L) {
     lua_pushinteger(L, ArrCount(CheckArr(L, 1)));
@@ -2125,6 +2172,7 @@ int LArrIndex(lua_State* L) {
     uint32_t esize = RttiSize(a->inner);
     char* data = ArrData(a);
     if (i < 1 || i > static_cast<lua_Integer>(n) || !esize || !Plausible(data)) return 0;
+    OwnerScope scope({a->ownerBlock, a->ownerPtr});
     PushValue(L, data + static_cast<size_t>(i - 1) * esize, a->inner, 0, false);
     return 1;
 }
@@ -3177,7 +3225,14 @@ int LEngineCall(lua_State* L) {
             break;
         case 'p':
             if (lua_isnoneornil(L, idx)) v = 0;
-            else if (Obj* o = static_cast<Obj*>(luaL_testudata(L, idx, kObj))) v = reinterpret_cast<uint64_t>(o->ptr);
+            else if (Obj* o = static_cast<Obj*>(luaL_testudata(L, idx, kObj))) {
+                v = reinterpret_cast<uint64_t>(o->ptr);
+                // A w3.new object handed to an engine function is the engine's now, as for a script native (below):
+                // it may keep it without a reference (the witcher woman's skinning attachments, attached through
+                // CMeshSkinningAttachment::vf43, stayed in the node's list; Lua's discard after the last handle left
+                // them freed there, the world's unload called into them, 27.11.). Lua never discards it.
+                if (o->block) g_newBlocks.erase(o->block);
+            }
             else v = static_cast<uint64_t>(luaL_checkinteger(L, idx));
             break;
         case 's': {  // the whole string with its length: packed structs hold zero bytes
@@ -4659,6 +4714,118 @@ int LTexTest(lua_State* L) {
         return 2;
     }
     lua_pushboolean(L, 1);
+    return 1;
+}
+// w3._tex_pin(depot path, DDS file under tw3se or absolute) -> true | nil, error; w3._tex_unpin(depot path) -> bool
+int LTexPin(lua_State* L) {
+    std::string err;
+    if (!TexturePin(luaL_checkstring(L, 1), BlendPath(luaL_checkstring(L, 2)), &err)) {
+        lua_pushnil(L);
+        lua_pushstring(L, err.c_str());
+        return 2;
+    }
+    lua_pushboolean(L, 1);
+    return 1;
+}
+// w3._tex_stamp(texture path, position map file, {layer, ...}): a layer {motif = file, x, y, z, nx, ny, nz, size,
+// turn = degrees, opacity, flip, ink = {r, g, b}} - its frame from the normal and the turn (up toward +z)
+// w3._tex_eye(depot path, layers file, {cat, veins, white, vein, outer, inner, pupil = {r, g, b} 0..255})
+int LTexEye(lua_State* L) {
+    const char* path = luaL_checkstring(L, 1);
+    std::wstring layers = BlendPath(luaL_checkstring(L, 2));
+    luaL_checktype(L, 3, LUA_TTABLE);
+    TexEyeLook k;
+    lua_getfield(L, 3, "cat");
+    k.cat = lua_toboolean(L, -1) != 0;
+    lua_pop(L, 1);
+    lua_getfield(L, 3, "veins");
+    if (lua_isnumber(L, -1)) k.veins = static_cast<float>(lua_tonumber(L, -1));
+    lua_pop(L, 1);
+    auto rgb = [&](const char* name, float* out) {
+        lua_getfield(L, 3, name);
+        if (lua_istable(L, -1))
+            for (int c = 0; c < 3; ++c) {
+                lua_geti(L, -1, c + 1);
+                out[c] = static_cast<float>(lua_tonumber(L, -1)) / 255.0f;
+                lua_pop(L, 1);
+            }
+        lua_pop(L, 1);
+    };
+    rgb("white", k.white), rgb("vein", k.vein), rgb("outer", k.outer), rgb("inner", k.inner), rgb("pupil", k.pupil);
+    std::string err;
+    if (!TextureEye(path, layers, k, &err)) {
+        lua_pushnil(L);
+        lua_pushstring(L, err.c_str());
+        return 2;
+    }
+    lua_pushboolean(L, 1);
+    return 1;
+}
+int LTexStamp(lua_State* L) {
+    const char* path = luaL_checkstring(L, 1);
+    std::wstring pm = BlendPath(luaL_checkstring(L, 2));
+    luaL_checktype(L, 3, LUA_TTABLE);
+    std::vector<TexStampLayer> layers;
+    lua_Integer n = luaL_len(L, 3);
+    for (lua_Integer i = 1; i <= n; ++i) {
+        lua_geti(L, 3, i);
+        if (!lua_istable(L, -1)) { lua_pop(L, 1); continue; }
+        auto num = [&](const char* k, float def) {
+            lua_getfield(L, -1, k);
+            float v = lua_isnumber(L, -1) ? static_cast<float>(lua_tonumber(L, -1)) : def;
+            lua_pop(L, 1);
+            return v;
+        };
+        TexStampLayer s;
+        lua_getfield(L, -1, "motif");
+        s.motif = BlendPath(luaL_checkstring(L, -1));
+        lua_pop(L, 1);
+        s.centre[0] = num("x", 0), s.centre[1] = num("y", 0), s.centre[2] = num("z", 0);
+        float nv[3] = {num("nx", 0), num("ny", 1), num("nz", 0)};
+        float len = std::sqrt(nv[0] * nv[0] + nv[1] * nv[1] + nv[2] * nv[2]);
+        if (len < 1e-6f) nv[1] = 1, len = 1;
+        for (float& v : nv) v /= len;
+        float up[3] = {-nv[2] * nv[0], -nv[2] * nv[1], 1 - nv[2] * nv[2]};
+        float ul = std::sqrt(up[0] * up[0] + up[1] * up[1] + up[2] * up[2]);
+        if (ul < 1e-4f) up[0] = -nv[1] * nv[0], up[1] = 1 - nv[1] * nv[1], up[2] = -nv[1] * nv[2],
+                        ul = std::sqrt(up[0] * up[0] + up[1] * up[1] + up[2] * up[2]);
+        for (float& v : up) v /= ul;
+        float rt[3] = {up[1] * nv[2] - up[2] * nv[1], up[2] * nv[0] - up[0] * nv[2], up[0] * nv[1] - up[1] * nv[0]};
+        float a = num("turn", 0) * 3.14159265f / 180.0f, c = std::cos(a), sn = std::sin(a);
+        for (int k = 0; k < 3; ++k) {
+            s.normal[k] = nv[k];
+            s.up[k] = up[k] * c + rt[k] * sn;
+            s.right[k] = rt[k] * c - up[k] * sn;
+        }
+        s.size = num("size", 0.1f), s.depth = num("depth", 0.04f), s.opacity = num("opacity", 1.0f);
+        s.facing = num("facing", 0.15f);
+        lua_getfield(L, -1, "flip");
+        s.flip = lua_toboolean(L, -1) != 0;
+        lua_pop(L, 1);
+        lua_getfield(L, -1, "ink");
+        if (lua_istable(L, -1)) {
+            s.tint = true;
+            for (int k = 0; k < 3; ++k) {
+                lua_geti(L, -1, k + 1);
+                s.colour[k] = static_cast<float>(lua_tonumber(L, -1)) / 255.0f;
+                lua_pop(L, 1);
+            }
+        }
+        lua_pop(L, 1);
+        layers.push_back(s);
+        lua_pop(L, 1);
+    }
+    std::string err;
+    if (!TextureStamp(path, pm, layers, &err)) {
+        lua_pushnil(L);
+        lua_pushstring(L, err.c_str());
+        return 2;
+    }
+    lua_pushboolean(L, 1);
+    return 1;
+}
+int LTexUnpin(lua_State* L) {
+    lua_pushboolean(L, TextureUnpin(luaL_checkstring(L, 1)));
     return 1;
 }
 int LBlendNormals(lua_State* L) {  // w3._bs_normals(set or live mesh, on) -> true | nil, error
@@ -7160,7 +7327,7 @@ lua_State* State() {
                            {"_bs_names", &LBlendNames}, {"_bs_state", &LBlendState}, {"_bs_unload", &LBlendUnload}, {"_hide_open", &LHideOpen}, {"_hide_bits", &LHideBits}, {"_hide_close", &LHideClose}, {"_hide_state", &LHideState}, {"_hide_forget", &LHideForget},
                            {"_bs_dump", &LBlendDump}, {"_bs_stats", &LBlendStats}, {"_shot_burst", &LShotBurst}, {"_bs_forget", &LBlendForget}, {"_bs_reset_all", &LBlendResetAll}, {"_render_rebuild", &LRenderRebuild},
                            {"_lm_new", &LLiveNew}, {"_lm_attach", &LLiveAttach}, {"_lm_fail", &LLiveFail}, {"_lm_close", &LLiveClose},
-                           {"_lm_info", &LLiveInfo}, {"_lm_write", &LLiveWrite}, {"_lm_bounds", &LLiveBounds}, {"_tex_probe", &LTexProbe}, {"_tex_test", &LTexTest}, {"_tex_stats", &LTexStats}, {"_tex_readback", &LTexReadback}, {"_bs_index_dump", &LIndexDump}, {"_skin_capture", &LSkinCapture}, {"_skin_mush", &LSkinMush}, {"_skin_dqs", &LSkinDqs}, {"_pso_trace", &LPsoTrace}, {"_skin_mush_mask", &LSkinMushMask}, {"_skin_mush_dump", &LMushDump}, {"_skin_overlay_test", &LSkinOverlayTest}, {"_skin_material_test", &LSkinMaterialTest}, {"_skin_overlay_raw", &LSkinOverlayRaw}, {"_bs_normals", &LBlendNormals}, {"_skin_caps_ex", &LSkinCapsulesEx},
+                           {"_lm_info", &LLiveInfo}, {"_lm_write", &LLiveWrite}, {"_lm_bounds", &LLiveBounds}, {"_tex_probe", &LTexProbe}, {"_tex_test", &LTexTest}, {"_tex_pin", &LTexPin}, {"_tex_unpin", &LTexUnpin}, {"_tex_stamp", &LTexStamp}, {"_tex_eye", &LTexEye},{"_tex_stats", &LTexStats}, {"_tex_readback", &LTexReadback}, {"_bs_index_dump", &LIndexDump}, {"_skin_capture", &LSkinCapture}, {"_skin_mush", &LSkinMush}, {"_skin_dqs", &LSkinDqs}, {"_pso_trace", &LPsoTrace}, {"_skin_mush_mask", &LSkinMushMask}, {"_skin_mush_dump", &LMushDump}, {"_skin_overlay_test", &LSkinOverlayTest}, {"_skin_material_test", &LSkinMaterialTest}, {"_skin_overlay_raw", &LSkinOverlayRaw}, {"_bs_normals", &LBlendNormals}, {"_skin_caps_ex", &LSkinCapsulesEx},
                            {"_skin_add", &LSkinAdd}, {"_skin_remove", &LSkinRemove}, {"_skin_caps", &LSkinCapsules},
                            {"_skin_stats", &LSkinStats}, {"_skin_state", &LSkinState},
                            {"_skin_weights", &LSkinWeights}, {"_skin_chunks", &LSkinChunks},

@@ -4,6 +4,9 @@
 //   hold    the block keeps its contents: a crash that stops with it is a use after free
 //   poison  the block's first 8 bytes become 0xdddddddddddddddd: the first use through its vtable or first pointer
 //           crashes at once, at the place that uses it, and the report says which free it was
+//   tagged  every size, held `quarantine_seconds` (2), poisoned with a tag that names its record: the free's stack is
+//           found from the poison even after the block went back, and at any fault the last free of each register's
+//           block (8M records a thread; with `quarantine_only`)
 // Each thread holds its own blocks and gives them back itself (the allocator may keep per-thread caches; no block is
 // freed by another thread than the one that freed it, no lock in the hot path). At a fault outside a guard the log
 // names the held block the fault address or a register lies in, with its free's stack.
@@ -131,7 +134,7 @@ bool g_rbPoison = false;  // quarantine_poison = on: stacks kept and blocks pois
 // One thread's blocks of the windows: a ring of records in address space reserved once, committed in 1 MB steps as
 // it fills (never moved: the fault handler reads it while other threads go on). Counters only grow: [head, tail)
 // are the records kept, [ret, tail) the blocks still held; a record stays after its block went back.
-constexpr size_t kRbMax = size_t(1) << 21;  // 2M records a thread
+constexpr size_t kRbMax = size_t(1) << 23;  // 8M records a thread (committed as they fill)
 struct RbBuf {
     DWORD tid = 0;
     uint32_t index = 0;  // in g_rbBufs: the poison tag names it
@@ -254,7 +257,12 @@ void SmallFree(void* p) {
     h.tick = now;
     RtlCaptureStackBackTrace(1, kFrames, h.frames, nullptr);
     uint64_t pat = 0xdddd000000000000ull | (uint64_t(b->index & 0xff) << 40) | (tail & 0xffffffffffull);
-    for (size_t o = 0; o + 8 <= g_smallSize; o += 8) memcpy(static_cast<char*>(p) + o, &pat, 8);
+    size_t len = g_smallSize;
+    if (g_mode == 5) {  // tagged: a small block whole (as CheckPoison reads it), others their first 8 bytes
+        size_t n = SmallBlockSize(p);
+        len = n ? n : 8;
+    }
+    for (size_t o = 0; o + 8 <= len; o += 8) memcpy(static_cast<char*>(p) + o, &pat, 8);
     b->tail.store(tail + 1, std::memory_order_release);
     ++g_heldTotal;
     int64_t c = ++g_heldNow, peak = g_heldPeak.load(std::memory_order_relaxed);
@@ -421,6 +429,11 @@ void FreeHook(void* p) {
     if (!p || t_inFree || !g_mode) return oFree(p);
     if (g_mode == 3) return RebuildFree(p);
     if (g_mode == 4) return SmallBlockSize(p) == g_smallSize ? SmallFree(p) : oFree(p);
+    if (g_mode == 5) {
+        void* f[kFrames] = {};
+        if (g_onlyMods && (RtlCaptureStackBackTrace(1, kFrames, f, nullptr), !FromMods(f))) return oFree(p);
+        return SmallFree(p);
+    }
     ++g_frees;
     Ring* r = MyRing();
     if (!r) {
@@ -809,7 +822,9 @@ std::string ReaderStack(const CONTEXT& ctx) {
 void QuarantineOnFault(EXCEPTION_POINTERS* ep) {
     if (!g_mode || (g_mode == 3 && !g_rbPoison) || !ep || !ep->ExceptionRecord || !ep->ContextRecord) return;
     if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return;
-    if (g_mode >= 2) {  // poison: only the faults through 0xdddd... (a guard's caught reads elsewhere stay out of it)
+    // poison: only the faults through 0xdddd... (a guard's caught reads elsewhere stay out of it); tagged: every
+    // fault, its registers looked up in the records (a block freed and given out again carries no poison any more)
+    if (g_mode >= 2 && g_mode != 5) {
         uint64_t fa = ep->ExceptionRecord->NumberParameters >= 2 ? ep->ExceptionRecord->ExceptionInformation[1] : 0;
         if (fa != ~0ull && (fa >> 48) != 0xdddd) return;
     }
@@ -845,7 +860,7 @@ void QuarantineOnFault(EXCEPTION_POINTERS* ep) {
 
 void InstallQuarantine() {
     std::string m = ConfigGet("quarantine", "off");
-    g_mode = m == "poison" ? 2 : m == "hold" || m == "on" ? 1 : m == "rebuild" ? 3 : m == "small" ? 4 : 0;
+    g_mode = m == "poison" ? 2 : m == "hold" || m == "on" ? 1 : m == "rebuild" ? 3 : m == "small" ? 4 : m == "tagged" ? 5 : 0;
     RegisterCommand("quarantine", &CmdQuarantine, "quarantine [find <hex address>]: freed memory held back (config quarantine = hold | poison)");
     g_keepCall = ConfigBool("rebuild_fix", true);
     if (ConfigBool("resize_fix", true))
@@ -894,10 +909,10 @@ void InstallQuarantine() {
         return;
     }
     Log("resize fix %s, rebuild fix %s", g_keepRet ? "on" : "off", g_keepCall ? "on" : "off");
-    g_holdMs = static_cast<ULONGLONG>(atof(ConfigGet("quarantine_seconds", g_mode == 3 ? "10" : "5").c_str()) * 1000);
+    g_holdMs = static_cast<ULONGLONG>(atof(ConfigGet("quarantine_seconds", g_mode == 3 ? "10" : g_mode == 5 ? "2" : "5").c_str()) * 1000);
     if (g_mode == 3) RegisterTick(&RebuildTick, nullptr);
-    g_rbPoison = (g_mode == 3 && ConfigBool("quarantine_poison", false)) || g_mode == 4;
-    if (g_mode == 4) {
+    g_rbPoison = (g_mode == 3 && ConfigBool("quarantine_poison", false)) || g_mode >= 4;
+    if (g_mode == 4 || g_mode == 5) {
         g_smallSize = static_cast<size_t>(atoi(ConfigGet("quarantine_small_size", "16").c_str()));
         RegisterTick(&RebuildTick, nullptr);  // (its log: blocks held, writes found)
     }
@@ -919,6 +934,11 @@ void InstallQuarantine() {
     if (!target || !Hook(target, reinterpret_cast<void*>(&FreeHook), reinterpret_cast<void**>(&oFree))) {
         g_mode = 0;
         Log("quarantine: Memory::Free not hooked - off");
+        return;
+    }
+    if (g_mode == 5) {
+        Log("quarantine: tagged - every freed block%s held %.1f s, poisoned with a tag of its record (its stack found "
+            "from the poison after it went back)", g_onlyMods ? " (only frees from mods)" : "", g_holdMs / 1000.0);
         return;
     }
     if (g_mode == 4) {

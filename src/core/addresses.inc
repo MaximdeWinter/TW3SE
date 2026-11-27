@@ -155,6 +155,9 @@ FUNC_OPT("CDiskFile::CDiskFile", 0x026ed340, "48 89 5C 24 10 48 89 74 24 18 48 8
 // a render command's memory of 0x28 bytes in the renderer's command ring (one of the per-size helpers the engine
 // has; without a renderer a static scratch block). The command is built there and committed with its slot 1
 FUNC_OPT("RenderCommandAlloc28", 0x004922f0, "48 83 EC 28 48 8B 0D ?? ?? ?? ?? 48 85 C9 74 ?? 48 8B 01 FF 90 80 00 00 00 48 85 C0 74 ?? 48 8B 0D ?? ?? ?? ?? 48 8B 01 FF 90 80 00 00 00 BA 28 00 00 00")
+// the same of 0x10 bytes: CRenderCommand_ReleaseRenderObjectOnRenderThread's (vtable, object), as
+// CMeshSkinningAttachment's Break builds it for its render object
+FUNC_OPT("RenderCommandAlloc10", 0x0032dc20, "48 83 EC 28 48 8B 0D ?? ?? ?? ?? 48 85 C9 74 ?? 48 8B 01 FF 90 80 00 00 00 48 85 C0 74 ?? 48 8B 0D ?? ?? ?? ?? 48 8B 01 FF 90 80 00 00 00 BA 10 00 00 00")
 // CDrawableComponent::RefreshRenderProxies(this): only while attached (+0x54 & 0x100000): out of the render scene,
 // proxies destroyed and made anew (slots 0x3b0, 0x3a0), back in; the mesh setter ends with it
 FUNC_OPT("CDrawableComponent::RefreshRenderProxies", 0x0234c2e0, "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 20 33 FF 48 8D 71 54 F7 41 54 00 00 10 00")

@@ -9,6 +9,8 @@
 // crash_report.txt, before LogOpen empties the log. The fault path writes with WriteFile into stack buffers only.
 #include "core.h"
 
+#include <dbghelp.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -446,6 +448,83 @@ void SessionNotesToLog() {
     Log("crash report: tw3se\\out\\crash_report.txt is written at the next start of the game");
 }
 
+// config crash_dump = on (a debugging aid, off by default): the first two faults a session notes each get a minidump,
+// tw3se\out\crash_<tick>.dmp - the memory round every pointer in the registers and on the stacks and the modules'
+// data, so a corrupted object and its neighbours can be read afterwards (what wrote there, by its values)
+// the faulting thread's registers' neighbourhood, three levels deep: 4 KB round each register, 1.5 KB at each pointer
+// found there (a list's buffer, an object's owner a field before), 256 bytes at each pointer in those (what a stray
+// pointer written into a buffer points at) - more than the dump's own 256 bytes round a pointer
+struct DumpRanges {
+    static constexpr int kMax = 16384;
+    uintptr_t at[kMax];
+    ULONG size[kMax];
+    int n = 0, next = 0;
+    void Add(uintptr_t a, ULONG sz) {
+        if (n < kMax && a > 0x10000 && a < 0x7fffffffffffull) at[n] = a, size[n++] = sz;
+    }
+};
+DumpRanges g_dumpRanges;
+
+BOOL CALLBACK DumpCallback(PVOID, const PMINIDUMP_CALLBACK_INPUT in, PMINIDUMP_CALLBACK_OUTPUT out) {
+    if (in->CallbackType == MemoryCallback) {
+        DumpRanges& r = g_dumpRanges;
+        while (r.next < r.n) {
+            int k = r.next++;
+            uint8_t probe = 0;
+            if (!SafeRead(reinterpret_cast<void*>(r.at[k]), &probe, 1)) continue;
+            out->MemoryBase = r.at[k];
+            out->MemorySize = r.size[k];
+            return TRUE;
+        }
+        return FALSE;
+    }
+    return TRUE;
+}
+
+void FaultDump(EXCEPTION_POINTERS* ep) {
+    static int s_on = -1;
+    static volatile LONG s_dumps = 0;
+    if (s_on < 0) s_on = ConfigBool("crash_dump", false) ? 1 : 0;
+    if (!s_on || InterlockedIncrement(&s_dumps) > 2) return;
+    using Write_t = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE, PMINIDUMP_EXCEPTION_INFORMATION,
+                                  PMINIDUMP_USER_STREAM_INFORMATION, PMINIDUMP_CALLBACK_INFORMATION);
+    HMODULE dh = LoadLibraryW(L"dbghelp.dll");
+    auto write = dh ? reinterpret_cast<Write_t>(GetProcAddress(dh, "MiniDumpWriteDump")) : nullptr;
+    if (!write) return;
+    wchar_t name[64];
+    swprintf(name, 64, L"\\crash_%llu.dmp", static_cast<unsigned long long>(GetTickCount64()));
+    HANDLE d = CreateFileW((OutDir() + name).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (d == INVALID_HANDLE_VALUE) return;
+    MINIDUMP_EXCEPTION_INFORMATION ei = {GetCurrentThreadId(), ep, FALSE};
+    DumpRanges& r = g_dumpRanges;
+    r.n = r.next = 0;
+    if (const CONTEXT* c = ep->ContextRecord) {
+        const DWORD64 regs[] = {c->Rax, c->Rbx, c->Rcx, c->Rdx, c->Rsi, c->Rdi, c->Rbp, c->R8, c->R9, c->R10, c->R11,
+                                c->R12, c->R13, c->R14, c->R15};
+        for (DWORD64 v : regs) {
+            uintptr_t a = static_cast<uintptr_t>(v) & ~uintptr_t(0xf);
+            r.Add(a - 0x800, 0x1000);
+            for (uintptr_t o = 0; o < 0x200; o += 8) {
+                uintptr_t p = 0;
+                if (!SafeRead(reinterpret_cast<void*>(a + o), &p, 8)) continue;
+                uintptr_t b = (p & ~uintptr_t(0xf)) - 0x200;
+                r.Add(b, 0x600);
+                for (uintptr_t k = 0; k < 0x600; k += 8) {
+                    uintptr_t p2 = 0;
+                    if (SafeRead(reinterpret_cast<void*>(b + k), &p2, 8) && (p2 >> 40) && !(p2 >> 47))
+                        r.Add((p2 & ~uintptr_t(0xf)) - 0x80, 0x100);
+                }
+            }
+        }
+    }
+    MINIDUMP_CALLBACK_INFORMATION cb = {&DumpCallback, nullptr};
+    write(GetCurrentProcess(), GetCurrentProcessId(), d,
+          static_cast<MINIDUMP_TYPE>(MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules | MiniDumpWithDataSegs |
+                                     MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithHandleData),
+          &ei, nullptr, &cb);
+    CloseHandle(d);
+}
+
 void SessionFault(EXCEPTION_POINTERS* ep) {
     if (!g_marker[0] || !ep || !ep->ExceptionRecord) return;
     const char* what = FaultText(ep->ExceptionRecord->ExceptionCode);
@@ -456,6 +535,7 @@ void SessionFault(EXCEPTION_POINTERS* ep) {
                                         (reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress) << 1));
     if (!what || InterlockedExchangePointer(&s_last, key) == key) return;
     if (InterlockedIncrement(&g_faults) > 3) return;
+    FaultDump(ep);
     uintptr_t at = reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress);
     HMODULE m = nullptr;
     char mod[MAX_PATH] = "?";
@@ -487,6 +567,10 @@ void SessionFault(EXCEPTION_POINTERS* ep) {
     // the stack says which loader got there)
     if (!ep->ContextRecord) return;
     CONTEXT ctx = *ep->ContextRecord;
+    // a call through a null or freed pointer stands on no code: the caller's return address is on top of the stack
+    // (a fault at ?+0x0 gave no callers at all, 27.11.)
+    if (!m && !SafeRead(reinterpret_cast<void*>(ctx.Rsp), &ctx.Rip, 8)) return;
+    if (!m) ctx.Rsp += 8;
     for (int k = 0; k < 24 && ctx.Rip; ++k) {
         HMODULE fm = nullptr;
         char fmod[MAX_PATH] = "?";

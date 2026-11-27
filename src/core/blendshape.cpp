@@ -424,28 +424,25 @@ bool HoldRenderMesh(uintptr_t rm) {
         return false;
     }
 }
-// On the main thread: the last reference runs the game's destructor, which must not run inside the render thread's
-// submit hook under g_mx.
+// On the main thread, never inside the render thread's submit hook under g_mx: the reference goes to the render
+// thread, where the last one runs the game's destructor.
 uint32_t RenderMeshRefs(void* rm) {
     uint32_t n = 0;
     SafeRead(static_cast<char*>(rm) + 8, &n, 4);
     return n;
 }
-bool ReleaseGuarded(void (*rel)(void*), void* rm) {
-    __try {
-        rel(rm);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
 void ReleaseRenderMesh(void* rm) {
-    auto rel = reinterpret_cast<void (*)(void*)>(Address("IRenderResource::Release"));
-    if (!rel) return;
     uint32_t before = RenderMeshRefs(rm);
     bool last = before == 1;  // the game's destructor runs: the memory is gone after
-    if (!ReleaseGuarded(rel, rm)) Log("blendshape: giving render mesh %p back faulted (caught)", rm);
-    else Log("blendshape: render mesh %p given back (%u references before%s)", rm, before, last ? ", it goes now" : "");
+    // (the render mesh's own Release, on the render thread: IRenderResource::Release only counts down and runs the
+    // destructor, the class's Release takes the renderer's lock and unlinks the mesh from its list of render
+    // resources first - our last reference given back that way left the freed mesh in the list, the next mesh wrote
+    // a pointer into whatever had the block then: PhysX's character controller cache, the game fell or hung in
+    // SweepTest::onRelease at a world change, 27.11., minidump and live read)
+    if (ReleaseOnRenderThread(rm))
+        Log("blendshape: render mesh %p given back (%u references before%s)", rm, before, last ? ", it goes on the render thread" : "");
+    else
+        Log("blendshape: giving render mesh %p back faulted (caught)", rm);
 }
 // After the lists already signalled (FreeSet runs before a lost set is recorded, or after the unload list's signal).
 void RetireRenderMesh(uintptr_t rm) { g_retireRm.push_back({g_fenceValue, rm}); }
@@ -2224,6 +2221,43 @@ void SubmitWork(ID3D12CommandQueue* q) {
             ++it;
         }
     }
+}
+
+namespace {
+bool VirtualReleaseGuarded(void* obj) {  // the object's own Release (IRenderObject slot 2), on this thread
+    __try {
+        reinterpret_cast<void (*)(void*)>((*reinterpret_cast<void***>(obj))[2])(obj);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+bool CommitReleaseGuarded(char* cmd, void* obj, void* vt) {
+    __try {
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(static_cast<char*>(obj) + 8));  // the command's own
+        memcpy(cmd, &vt, 8);
+        memcpy(cmd + 8, &obj, 8);
+        reinterpret_cast<void (*)(void*)>((*reinterpret_cast<void***>(cmd))[1])(cmd);   // IRenderCommand::Commit
+        reinterpret_cast<void (*)(void*)>((*reinterpret_cast<void***>(obj))[2])(obj);   // ours: IRenderObject::Release
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+}  // namespace
+
+// A render object's reference given back as the engine gives its own back (CMeshSkinningAttachment's Break,
+// 0x24d3a70): a CRenderCommand_ReleaseRenderObjectOnRenderThread takes a reference of its own and is committed, then
+// ours goes; the command lets its one go on the render thread between frames, through the object's own Release (slot
+// 2, which unlinks a render mesh or texture from the renderer's list under its lock before the destructor). Without
+// the command (another build): the object's own Release here. -> false when it faulted.
+bool ReleaseOnRenderThread(void* obj) {
+    if (!obj) return false;
+    static void* vt = VtableOfType(".?AVCRenderCommand_ReleaseRenderObjectOnRenderThread@@");
+    auto alloc = reinterpret_cast<char* (*)()>(Address("RenderCommandAlloc10"));
+    char* cmd = vt && alloc ? alloc() : nullptr;
+    if (!cmd) return VirtualReleaseGuarded(obj);
+    return CommitReleaseGuarded(cmd, obj, vt);
 }
 
 }  // namespace tw3se

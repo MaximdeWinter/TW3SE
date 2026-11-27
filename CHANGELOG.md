@@ -1,5 +1,36 @@
 # Changelog
 
+## Next
+
+**New:**
+
+- `w3.texture.write(path, dds)` puts the pixels of a DDS into a loaded texture while the game runs, and again
+  whenever the streaming loads it anew; `w3.texture.release(path)`
+- `w3.texture.stamp(path, posmap, layers)` puts tattoos and scars on a texture written with `w3.texture.write`, each
+  layer placed through a position map of the mesh
+- `w3.texture.eye(path, layers, look)` mixes an eye texture from layers (the white and its veins, the iris, a round
+  or a cat's pupil) and puts it on the texture
+- `crash_dump = on` in tw3se.config: a crash writes a minidump into `tw3se\out` (the memory round the crash, for a
+  bug report)
+
+**Fixes:**
+
+- Shift held at the start turned on safe mode while another program was in front (a game started by a tool while
+  the player sprinted in another game). Shift counts while the game, the desktop or a launcher is in front
+- A mod switched on again in the game's **Mods** menu stayed off for TW3SE after game patch 5.02 (`Enabled=true` in
+  `mods.settings`)
+- A crash or a hang a few seconds into a new world after a mod used blend shapes or `w3.texture.write` (TW3SE gave
+  its render meshes and textures back on a path that left them in the renderer's list)
+- A mesh in `tw3se\files` with its `.1.buffer` files beside it stayed invisible
+- Lua: an array or a struct taken from an object that is gone gives an error and a line in `tw3se.log` (writing into
+  it changed memory the game had handed on)
+- An object made with `w3.new` and handed to `w3.engine_call` belongs to the game from then on (Lua discarded it
+  while the game still used it)
+- A part made anew (another world, a new head or hairstyle) kept the shared mesh after `w3.deform.own`, and
+  `w3.deform.release` gave it the old world's mesh
+- The crash report names the callers of a call through a null pointer (`?+0x0`)
+- The overlay takes half the time per frame on the CPU (a frame's rectangles and text in one draw per texture)
+
 ## 1.4.3
 
 **New:**

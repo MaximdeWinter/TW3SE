@@ -593,7 +593,15 @@ void MenuKey(const char* how) {
     }
 }
 
+std::atomic<uint64_t> g_frameUs{0}, g_publishUs{0}, g_frameCount{0};  // overlaystats: the main thread's part
+uint64_t QpcUs() {
+    static LARGE_INTEGER f = [] { LARGE_INTEGER x; QueryPerformanceFrequency(&x); return x; }();
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return static_cast<uint64_t>(t.QuadPart * 1000000 / f.QuadPart);
+}
 void Frame() {
+    uint64_t t0 = QpcUs();
     {
         std::vector<Msg> msgs;
         {
@@ -629,7 +637,12 @@ void Frame() {
         posted = want;
         if (want) PostMessageW(g_hwnd, WM_SETCURSOR, reinterpret_cast<WPARAM>(g_hwnd), MAKELPARAM(HTCLIENT, WM_MOUSEMOVE));
     }
+    uint64_t t1 = QpcUs();
     Publish();
+    uint64_t t2 = QpcUs();
+    g_frameUs += t2 - t0;
+    g_publishUs += t2 - t1;
+    ++g_frameCount;
     ++g_frames;
 }
 
@@ -713,6 +726,12 @@ void UiRender(ID3D12Device* dev, ID3D12CommandQueue* queue, int frames, DXGI_FOR
 }
 
 bool UiWantsDraw() { return g_contextReady && (Showing() || !g_rendererReady); }
+
+// overlaystats: the main thread's ImGui frames since the last reset (count, us building them in all, us copying)
+void UiFrameTimes(uint64_t* frames, uint64_t* us, uint64_t* publishUs, bool reset) {
+    *frames = g_frameCount.load(), *us = g_frameUs.load(), *publishUs = g_publishUs.load();
+    if (reset) g_frameCount = 0, g_frameUs = 0, g_publishUs = 0;
+}
 
 // w3.ui.overlay(on): the Lua windows stay over the game while the menu is closed (lua_ui_draw.cpp)
 void UiSetOverlay(bool on) {

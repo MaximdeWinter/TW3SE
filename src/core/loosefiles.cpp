@@ -158,12 +158,25 @@ std::vector<uint8_t> MetadataStore(const std::vector<LooseFile>& files, uint32_t
     Put<uint32_t>(b, maxSize);
     PutVlq(b, static_cast<int64_t>(strings.size()));
     b.insert(b.end(), strings.begin(), strings.end());
-    // file infos: name, path hash, stored size, size, first entry, compression, buffer id, has buffer
+    // file infos: name, path hash, stored size, size, first entry, buffer id, has buffer, compression. A file with
+    // buffers of its own (a mesh: <path>.1.buffer, .2.buffer ... beside it) points at them in the buffers below - the
+    // game finds a mesh's vertices only through them (27.11.: a mesh in tw3se\files drew nothing without; measured on
+    // a mod bundle wcc_lite made: the mesh's buffer id is its first buffer's place in the list, "has buffer" 1)
+    std::map<std::string, uint32_t> fileOf;
+    for (size_t i = 0; i < byData.size(); ++i) fileOf[byData[i]->path] = static_cast<uint32_t>(i + 1);
+    std::vector<uint32_t> buffers;
     PutVlq(b, static_cast<int64_t>(byData.size() + 1));
     for (int k = 0; k < 8; ++k) Put<uint32_t>(b, 0);
     for (size_t i = 0; i < byData.size(); ++i) {
         uint32_t s = static_cast<uint32_t>(byData[i]->size);
-        for (uint32_t v : {pathOff[i], 0u, s, s, static_cast<uint32_t>(i + 1), 0u, 0u, 0u}) Put<uint32_t>(b, v);
+        uint32_t bufferId = 0, hasBuffer = 0;
+        for (int n = 1;; ++n) {
+            auto f = fileOf.find(byData[i]->path + "." + std::to_string(n) + ".buffer");
+            if (f == fileOf.end()) break;
+            if (n == 1) bufferId = static_cast<uint32_t>(buffers.size()), hasBuffer = 1;
+            buffers.push_back(f->second);
+        }
+        for (uint32_t v : {pathOff[i], 0u, s, s, static_cast<uint32_t>(i + 1), bufferId, hasBuffer, 0u}) Put<uint32_t>(b, v);
     }
     // entries: u64 offset, stored size, next entry, file, bundle
     PutVlq(b, static_cast<int64_t>(byData.size() + 1));
@@ -179,7 +192,12 @@ std::vector<uint8_t> MetadataStore(const std::vector<LooseFile>& files, uint32_t
     for (int k = 0; k < 4; ++k) Put<uint32_t>(b, 0);
     Put<uint64_t>(b, bundleSize - dataStart);
     for (uint32_t v : {dataStart, bundleName, byData.empty() ? 0u : 1u, static_cast<uint32_t>(byData.size())}) Put<uint32_t>(b, v);
-    b.push_back(0x80);  // buffers: none (wcc_lite writes the empty count as a negative zero)
+    if (buffers.empty()) {
+        b.push_back(0x80);  // buffers: none (wcc_lite writes the empty count as a negative zero)
+    } else {
+        PutVlq(b, static_cast<int64_t>(buffers.size()));
+        for (uint32_t f : buffers) Put<uint32_t>(b, f);
+    }
     PutVlq(b, static_cast<int64_t>(dirs.size()));
     for (auto& d : dirs) {
         Put<int32_t>(b, d.first);

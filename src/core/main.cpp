@@ -130,6 +130,35 @@ const char* GameStore() {
     return "unknown";
 }
 
+// Shift held at the start, from the player: only while the window in front is this game, the desktop or a launcher
+// (26.11.: a game started by a tool while the player held Shift in another game - sprinting - came up in safe mode,
+// without its plugins)
+bool ShiftForSafeMode() {
+    if ((GetAsyncKeyState(VK_SHIFT) & 0x8000) == 0) return false;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+    if (pid == 0 || pid == GetCurrentProcessId()) return true;
+    std::wstring name;
+    if (HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) {
+        wchar_t buf[MAX_PATH];
+        DWORD n = MAX_PATH;
+        if (QueryFullProcessImageNameW(h, 0, buf, &n)) name.assign(buf, n);
+        CloseHandle(h);
+    }
+    size_t slash = name.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) name = name.substr(slash + 1);
+    for (wchar_t& c : name) c = towlower(c);
+    static const wchar_t* launchers[] = {L"explorer.exe", L"steam.exe", L"steamwebhelper.exe", L"galaxyclient.exe",
+                                         L"galaxyclient helper.exe", L"epicgameslauncher.exe", L"modorganizer.exe",
+                                         L"vortex.exe", L"redprelauncher.exe", L"witcher3.exe"};
+    for (const wchar_t* l : launchers)
+        if (name == l) return true;
+    char shown[MAX_PATH] = {};
+    WideCharToMultiByte(CP_UTF8, 0, name.c_str(), -1, shown, sizeof shown, nullptr, nullptr);
+    Log("safe mode: Shift held, but in another program in front (%s) - not taken", shown);
+    return false;
+}
+
 void StartUp() {
     TakeLastSession();  // before LogOpen empties tw3se.log
     LogOpen(g_dir + L"\\tw3se.log");
@@ -138,7 +167,7 @@ void StartUp() {
     LoadConfig();
     // safe mode: Shift held while the game starts (or safe_mode = on): the Lua mods and the plugins stay out, to see
     // whether one of them makes the game crash
-    g_safe = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0 || ConfigBool("safe_mode", false);
+    g_safe = ShiftForSafeMode() || ConfigBool("safe_mode", false);
     if (g_safe) Log("safe mode: %s - no Lua mods, no plugins", ConfigBool("safe_mode", false) ? "safe_mode = on" : "Shift held");
     // one half of it (to find which half a crash comes with): safe_mode = plugins | lua
     std::string half = ConfigGet("safe_mode", "off");

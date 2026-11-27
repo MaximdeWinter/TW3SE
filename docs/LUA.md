@@ -5,7 +5,7 @@ game object and calls the game's functions, native and WitcherScript, while the 
 as it is sent.
 
 <!-- toc -->
-**Contents:** [Where Lua runs](#where-lua-runs), [A mod's folder](#a-mods-folder), [Objects](#objects), [Calling functions](#calling-functions), [Latent functions](#latent-functions), [Looking things up](#looking-things-up), [Game events](#game-events), [Hooks (change behaviour)](#hooks-change-behaviour), [Where the scripts are](#where-the-scripts-are), [New objects](#new-objects), [Every frame and on a timer](#every-frame-and-on-a-timer), [Keys](#keys), [Sounds](#sounds), [Time, weather and light](#time-weather-and-light), [Camera](#camera), [Stats, abilities and buffs](#stats-abilities-and-buffs), [Inventory and money](#inventory-and-money), [Horse](#horse), [Spawning and AI](#spawning-and-ai), [Effects and light](#effects-and-light), [Materials](#materials), [Blend shapes](#blend-shapes), [Physics](#physics), [Animation and figures](#animation-and-figures), [Drawing over the world](#drawing-over-the-world), [The game's HUD](#the-games-hud), [Gwent](#gwent), [Quests, map pins and facts](#quests-map-pins-and-facts), [Texts by string id](#texts-by-string-id), [The world](#the-world), [Engine settings](#engine-settings), [Scenes](#scenes), [Console commands and script lines](#console-commands-and-script-lines), [Which clicks the UI takes](#which-clicks-the-ui-takes), [Keys and the mouse as Windows has them](#keys-and-the-mouse-as-windows-has-them), [Files and folders](#files-and-folders), [Network](#network), [Data that goes with the save](#data-that-goes-with-the-save), [Objects you keep](#objects-you-keep), [Text and boxes over the game](#text-and-boxes-over-the-game), [The skeleton of a figure](#the-skeleton-of-a-figure), [Windows in the in-game UI](#windows-in-the-in-game-ui), [Settings in the TW3SE Menu](#settings-in-the-tw3se-menu), [Helpers](#helpers), [WitcherScript calls Lua](#witcherscript-calls-lua), [Functions for WitcherScript, written in Lua](#functions-for-witcherscript-written-in-lua), [Mods that load again](#mods-that-load-again), [Mods that use other mods](#mods-that-use-other-mods), [Where the time goes](#where-the-time-goes), [Examples](#examples), [Tests](#tests)
+**Contents:** [Where Lua runs](#where-lua-runs), [A mod's folder](#a-mods-folder), [Objects](#objects), [Calling functions](#calling-functions), [Latent functions](#latent-functions), [Looking things up](#looking-things-up), [Game events](#game-events), [Hooks (change behaviour)](#hooks-change-behaviour), [Where the scripts are](#where-the-scripts-are), [New objects](#new-objects), [Every frame and on a timer](#every-frame-and-on-a-timer), [Keys](#keys), [Sounds](#sounds), [Time, weather and light](#time-weather-and-light), [Camera](#camera), [Stats, abilities and buffs](#stats-abilities-and-buffs), [Inventory and money](#inventory-and-money), [Horse](#horse), [Spawning and AI](#spawning-and-ai), [Effects and light](#effects-and-light), [Materials](#materials), [Textures](#textures), [Blend shapes](#blend-shapes), [Physics](#physics), [Animation and figures](#animation-and-figures), [Drawing over the world](#drawing-over-the-world), [The game's HUD](#the-games-hud), [Gwent](#gwent), [Quests, map pins and facts](#quests-map-pins-and-facts), [Texts by string id](#texts-by-string-id), [The world](#the-world), [Engine settings](#engine-settings), [Scenes](#scenes), [Console commands and script lines](#console-commands-and-script-lines), [Which clicks the UI takes](#which-clicks-the-ui-takes), [Keys and the mouse as Windows has them](#keys-and-the-mouse-as-windows-has-them), [Files and folders](#files-and-folders), [Network](#network), [Data that goes with the save](#data-that-goes-with-the-save), [Objects you keep](#objects-you-keep), [Text and boxes over the game](#text-and-boxes-over-the-game), [The skeleton of a figure](#the-skeleton-of-a-figure), [Windows in the in-game UI](#windows-in-the-in-game-ui), [Settings in the TW3SE Menu](#settings-in-the-tw3se-menu), [Helpers](#helpers), [WitcherScript calls Lua](#witcherscript-calls-lua), [Functions for WitcherScript, written in Lua](#functions-for-witcherscript-written-in-lua), [Mods that load again](#mods-that-load-again), [Mods that use other mods](#mods-that-use-other-mods), [Where the time goes](#where-the-time-goes), [Examples](#examples), [Tests](#tests)
 <!-- /toc -->
 
 ## Where Lua runs
@@ -57,8 +57,8 @@ Mods\modBetterWolves\
 `require` finds the mod's own modules first, by the name with dots for folders. Each mod keeps its own: two mods can
 each have a `util.lua`. Any other name comes from `tw3se\lua\` (`require("lib.w3util")`).
 
-A mod switched off in the game's `mods.settings` (`Enabled=0`) is off for TW3SE too. Two mod folders with the same
-name: the one in `tw3se\mods` counts, and `tw3se.log` names the other.
+A mod switched off in the game's `mods.settings` (`Enabled=0` or `Enabled=false`) is off for TW3SE too. Two mod
+folders with the same name: the one in `tw3se\mods` counts, and `tw3se.log` names the other.
 
 ## Objects
 
@@ -797,6 +797,22 @@ shows a few frames later. It returns true, or nil and the reason (for HairWorks 
 
 `w3.refresh(component)` draws one component anew from its current data. It returns false for a component outside
 the world.
+
+## Textures
+
+```lua
+w3.texture.write([[characters\models\geralt\head\model\h_01_mg__geralt_d02.xbm]], [[mymod\geralt_tan_d02.dds]])
+w3.texture.release([[characters\models\geralt\head\model\h_01_mg__geralt_d02.xbm]])
+```
+
+`w3.texture.write(path, dds)` puts the pixels of a DDS into a loaded texture while the game runs, from the next frame
+on. The DDS has the texture's full size and its block format (BC1 for most diffuse maps; BC2 to BC7, RGBA8 and BGRA8
+work too) with its mip levels. The path of the DDS is under `tw3se\` or absolute. Every object that draws the texture
+shows the new pixels, the heads of patch 5.02 too (their material stays the one from loading, the texture is
+the same). The texture keeps them while the streaming loads it at another size: TW3SE writes them again. It returns
+true, or nil and the reason (another size, another format, the texture not loaded).
+
+`w3.texture.release(path)` stops that. The texture keeps the written pixels until the game loads it again.
 
 ## Blend shapes
 

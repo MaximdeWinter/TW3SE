@@ -457,6 +457,35 @@ bool g_ovDisabled = false;  // latched on init/draw failure so a broken pipeline
 bool g_ovInit = false;
 UINT g_ovW = 0, g_ovH = 0, g_ovCount = 0;
 DXGI_FORMAT g_ovFmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+// overlaystats: what the overlay costs since the last reset - the present thread's time by part (us), the quads it
+// drew, the GPU time of its list (timestamps around it, read back once its allocator comes round again)
+struct OvStats {
+    uint64_t frames = 0, totalUs = 0, maxUs = 0, waitUs = 0, drawUs = 0, uiUs = 0, submitUs = 0, quads = 0;
+    uint64_t gpuTicks = 0, gpuFrames = 0, gpuMaxTicks = 0, draws = 0, skipped = 0;
+};
+OvStats g_st;
+uint64_t g_frameQuads = 0, g_frameDraws = 0;
+// the frame's quads (PushQuad) and, per back buffer, the upload buffer they go into (mapped while it lives)
+struct BatchQuad {
+    float d[16];  // dst xywh (NDC), uv xywh, colour rgba, mode, 3 unused
+    UINT slot;    // the texture (SRV slot)
+};
+std::vector<BatchQuad> g_batch;
+std::vector<ID3D12Resource*> g_qbuf;   // upload heap (the CPU writes the quads here)
+std::vector<ID3D12Resource*> g_qgpu;   // default heap: the copy the vertex shader reads (reads from the upload heap
+                                       // go over the bus, 6 a quad: 0.13 ms for 1000 quads, measured)
+std::vector<uint8_t*> g_qmap;
+std::vector<UINT> g_qcap;
+ID3D12QueryHeap* g_qHeap = nullptr;
+ID3D12Resource* g_qRead = nullptr;
+UINT64 g_tsFreq = 0;
+std::vector<bool> g_qPending;
+uint64_t OvUs() {
+    static LARGE_INTEGER f = [] { LARGE_INTEGER x; QueryPerformanceFrequency(&x); return x; }();
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return static_cast<uint64_t>(t.QuadPart * 1000000 / f.QuadPart);
+}
 // uishot: the back buffer after everything was drawn, into a readback buffer, saved once the GPU is done
 std::mutex g_shotMx;
 std::string g_shotPath;            // asked for (main thread) -> taken by the render thread
@@ -619,6 +648,16 @@ void OverlayShutdown(bool waitGpu = true) {
     g_allocFence.clear();
     SafeRelease(g_ovPso);
     SafeRelease(g_ovRoot);
+    SafeRelease(g_qHeap);
+    SafeRelease(g_qRead);
+    g_qPending.clear();
+    for (auto& q : g_qbuf) SafeRelease(q);
+    for (auto& q : g_qgpu) SafeRelease(q);
+    g_qbuf.clear();
+    g_qgpu.clear();
+    g_qmap.clear();
+    g_qcap.clear();
+    g_batch.clear();
     SafeRelease(g_srvHeap);
     SafeRelease(g_atlasUpload);
     SafeRelease(g_atlas);
@@ -639,20 +678,28 @@ void OverlayShutdown(bool waitGpu = true) {
 // One shader for every overlay primitive. VS builds a quad from SV_VertexID, placed by root constants (dst =
 // NDC rect, uv = texture rect). PS branches on `mode`: 0 = solid colour, 1 = R8 coverage*colour (text),
 // 2 = RGBA texture*colour (image).
+// Every quad of a frame is one entry in a structured buffer (dst, uv, colour, mode), drawn as two triangles of a
+// triangle list (6 vertices, the quad from SV_VertexID / 6: instancing with 4 vertices an instance left most of
+// the GPU's waves empty). One draw per run of quads with the same texture, in the order they were given (blending
+// keeps the API order within a draw).
 static const char* kOverlayHlsl =
-    "cbuffer K : register(b0) { float4 dst; float4 uv; float4 col; float mode; };"
+    "cbuffer K : register(b0) { uint base; };"
+    "struct Q { float4 dst; float4 uv; float4 col; float4 m; };"
+    "StructuredBuffer<Q> gQ : register(t1);"
     "Texture2D gTex : register(t0); SamplerState gSmp : register(s0);"
-    "struct V { float4 pos : SV_POSITION; float2 uv : TEXCOORD; };"
-    "V VSMain(uint id : SV_VertexID) {"
+    "struct V { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; nointerpolation float4 col : COLOR0;"
+    "  nointerpolation float mode : TEXCOORD1; };"
+    "V VSMain(uint vid : SV_VertexID) {"
+    "  Q q = gQ[base + vid / 6]; uint id = vid % 6; id = id < 3 ? id : id - 2;"
     "  float2 c = float2((id>>1)&1, id&1);"
-    "  V o; o.pos = float4(dst.x + c.x*dst.z, dst.y - c.y*dst.w, 0, 1);"
-    "  o.uv = float2(uv.x + c.x*uv.z, uv.y + c.y*uv.w); return o;"
+    "  V o; o.pos = float4(q.dst.x + c.x*q.dst.z, q.dst.y - c.y*q.dst.w, 0, 1);"
+    "  o.uv = float2(q.uv.x + c.x*q.uv.z, q.uv.y + c.y*q.uv.w); o.col = q.col; o.mode = q.m.x; return o;"
     "}"
     "float4 PSMain(V i) : SV_Target {"
-    "  if (mode < 0.5) return col;"
+    "  if (i.mode < 0.5) return i.col;"
     "  float4 t = gTex.Sample(gSmp, i.uv);"
-    "  if (mode < 1.5) return float4(col.rgb, col.a * t.r);"
-    "  if (mode < 2.5) return t * col;"
+    "  if (i.mode < 1.5) return float4(i.col.rgb, i.col.a * t.r);"
+    "  if (i.mode < 2.5) return t * i.col;"
     "  return float4(t.rgb, 1);"
     "}";
 
@@ -805,10 +852,13 @@ bool OverlayInitPipelines() {
     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     range.NumDescriptors = 1;
     range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
-    D3D12_ROOT_PARAMETER rp[2] = {};
+    D3D12_ROOT_PARAMETER rp[3] = {};
     rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    rp[0].Constants.Num32BitValues = 13;  // dst(4) + uv(4) + colour(4) + mode(1)
-    rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    rp[0].Constants.Num32BitValues = 1;  // the run's first quad in the buffer
+    rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;  // the frame's quads (t1)
+    rp[2].Descriptor.ShaderRegister = 1;
+    rp[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
     rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     rp[1].DescriptorTable.NumDescriptorRanges = 1;
     rp[1].DescriptorTable.pDescriptorRanges = &range;
@@ -819,7 +869,7 @@ bool OverlayInitPipelines() {
     smp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     smp.MaxLOD = D3D12_FLOAT32_MAX;
     D3D12_ROOT_SIGNATURE_DESC rd = {};
-    rd.NumParameters = 2;
+    rd.NumParameters = 3;
     rd.pParameters = rp;
     rd.NumStaticSamplers = 1;
     rd.pStaticSamplers = &smp;
@@ -883,13 +933,70 @@ bool OverlayInitPipelines() {
 // root sig / PSO / descriptor heap / topology are already bound by OverlayDraw. Colour is 0xRRGGBBAA. ---
 void PushQuad(float x, float y, float w, float h, float u0, float v0, float uw, float vh, float r, float g,
               float b, float a, float mode, UINT srvSlot) {
-    float k[13] = {x / g_ovW * 2.0f - 1.0f, 1.0f - y / g_ovH * 2.0f, w / g_ovW * 2.0f, h / g_ovH * 2.0f,
-                   u0, v0, uw, vh, r, g, b, a, mode};
-    D3D12_GPU_DESCRIPTOR_HANDLE gh = g_srvHeap->GetGPUDescriptorHandleForHeapStart();
-    gh.ptr += static_cast<UINT64>(srvSlot) * g_srvStride;
-    g_cl->SetGraphicsRootDescriptorTable(1, gh);
-    g_cl->SetGraphicsRoot32BitConstants(0, 13, k, 0);
-    g_cl->DrawInstanced(4, 1, 0, 0);
+    g_batch.push_back({{x / g_ovW * 2.0f - 1.0f, 1.0f - y / g_ovH * 2.0f, w / g_ovW * 2.0f, h / g_ovH * 2.0f, u0, v0,
+                        uw, vh, r, g, b, a, mode, 0, 0, 0},
+                       srvSlot});
+    ++g_frameQuads;
+}
+
+// The frame's quads into this back buffer's upload buffer (grown when they do not fit; its last list is done, the
+// allocator's fence was waited for) and one draw per run of the same texture.
+void FlushQuads(UINT idx) {
+    UINT n = static_cast<UINT>(g_batch.size());
+    if (!n || idx >= g_qbuf.size()) return;
+    if (n > g_qcap[idx]) {
+        SafeRelease(g_qbuf[idx]);
+        SafeRelease(g_qgpu[idx]);
+        g_qmap[idx] = nullptr;
+        UINT cap = 1024;
+        while (cap < n) cap *= 2;
+        D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_UPLOAD};
+        D3D12_RESOURCE_DESC bd = {};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = static_cast<UINT64>(cap) * sizeof(BatchQuad::d);
+        bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        D3D12_RANGE none = {0, 0};
+        D3D12_HEAP_PROPERTIES dp = {D3D12_HEAP_TYPE_DEFAULT};
+        if (FAILED(g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                  nullptr, IID_PPV_ARGS(&g_qbuf[idx]))) ||
+            FAILED(g_dev->CreateCommittedResource(&dp, D3D12_HEAP_FLAG_NONE, &bd,
+                                                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                                                  IID_PPV_ARGS(&g_qgpu[idx]))) ||
+            FAILED(g_qbuf[idx]->Map(0, &none, reinterpret_cast<void**>(&g_qmap[idx])))) {
+            SafeRelease(g_qbuf[idx]);
+            SafeRelease(g_qgpu[idx]);
+            g_qcap[idx] = 0;
+            g_batch.clear();
+            return;
+        }
+        g_qcap[idx] = cap;
+    }
+    for (UINT i = 0; i < n; ++i) memcpy(g_qmap[idx] + static_cast<size_t>(i) * sizeof(BatchQuad::d), g_batch[i].d, sizeof(BatchQuad::d));
+    D3D12_RESOURCE_BARRIER qb = {};
+    qb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    qb.Transition.pResource = g_qgpu[idx];
+    qb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    qb.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    qb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    g_cl->ResourceBarrier(1, &qb);
+    g_cl->CopyBufferRegion(g_qgpu[idx], 0, g_qbuf[idx], 0, static_cast<UINT64>(n) * sizeof(BatchQuad::d));
+    std::swap(qb.Transition.StateBefore, qb.Transition.StateAfter);
+    g_cl->ResourceBarrier(1, &qb);
+    g_cl->SetGraphicsRootShaderResourceView(2, g_qgpu[idx]->GetGPUVirtualAddress());
+    UINT start = 0;
+    for (UINT i = 1; i <= n; ++i) {
+        if (i < n && g_batch[i].slot == g_batch[start].slot) continue;
+        D3D12_GPU_DESCRIPTOR_HANDLE gh = g_srvHeap->GetGPUDescriptorHandleForHeapStart();
+        gh.ptr += static_cast<UINT64>(g_batch[start].slot) * g_srvStride;
+        g_cl->SetGraphicsRootDescriptorTable(1, gh);
+        g_cl->SetGraphicsRoot32BitConstant(0, start, 0);
+        g_cl->DrawInstanced(6 * (i - start), 1, 0, 0);
+        ++g_frameDraws;
+        start = i;
+    }
+    g_batch.clear();
 }
 inline void Unpack(uint32_t c, float& r, float& g, float& b, float& a) {
     r = ((c >> 24) & 0xff) / 255.0f;
@@ -974,6 +1081,28 @@ bool OverlayInit(IDXGISwapChain3* sc) {
     if (!g_fenceEvent) return false;
 
     if (!OverlayInitPipelines()) return false;  // glyph atlas + shared root signature / PSO
+    InstallStreamlineWatch();  // slui.cpp: what the game tags for frame generation
+    // overlaystats' GPU time: two timestamps per back buffer, resolved into a readback buffer (optional)
+    D3D12_QUERY_HEAP_DESC qd = {D3D12_QUERY_HEAP_TYPE_TIMESTAMP, g_ovCount * 2, 0};
+    D3D12_HEAP_PROPERTIES rp = {D3D12_HEAP_TYPE_READBACK};
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = g_ovCount * 16ull;
+    rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(g_dev->CreateQueryHeap(&qd, IID_PPV_ARGS(&g_qHeap))) ||
+        FAILED(g_dev->CreateCommittedResource(&rp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                              IID_PPV_ARGS(&g_qRead))) ||
+        FAILED(g_queue->GetTimestampFrequency(&g_tsFreq))) {
+        SafeRelease(g_qHeap);
+        SafeRelease(g_qRead);
+    }
+    g_qPending.assign(g_ovCount, false);
+    g_qbuf.assign(g_ovCount, nullptr);
+    g_qgpu.assign(g_ovCount, nullptr);
+    g_qmap.assign(g_ovCount, nullptr);
+    g_qcap.assign(g_ovCount, 0);
     return true;
 }
 
@@ -1052,6 +1181,7 @@ void ViewDraw(UINT idx) {
     g_cl->ClearRenderTargetView(g_rtv[idx], black, 0, nullptr);
     ViewFit(x, y, w, h);
     PushQuad(x, y, w, h, 0, 0, 1, 1, 1, 1, 1, 1, 3.0f, kViewSlot);
+    std::rotate(g_batch.begin(), g_batch.end() - 1, g_batch.end());  // under the primitives collected before
 }
 
 void OverlayDraw(IDXGISwapChain3* /*scProxy*/) {
@@ -1059,15 +1189,62 @@ void OverlayDraw(IDXGISwapChain3* /*scProxy*/) {
     BurstCollect();
     UINT idx = g_scNative->GetCurrentBackBufferIndex();  // index on the native swap chain, matching our buffers
     if (idx >= g_ovCount || !g_backbuf[idx]) return;
+    // the plugins' and Lua's primitives first: they only collect quads (PushQuad), nothing is recorded yet
+    uint64_t td = OvUs();
+    g_batch.clear();
+    g_recording = true;
+    for (auto& e : g_overlayDrawCbs) {
+        if (e.dead) continue;
+        DWORD code = 0;
+        if (!OverlayCbGuarded(e.cb, e.ctx, &code)) {
+            e.dead = true;
+            Log("overlay: draw callback %p dropped: exception 0x%08x", e.cb, code);
+        }
+    }
+    if (g_ovDraw) ApiDrawText(12.0f, 10.0f, 0xFFFFFFFFu, "TW3SE overlay");  // dev watermark (`overlaytest draw`)
+    g_recording = false;
+    g_st.drawUs += OvUs() - td;
+    // nothing to put on the picture this frame: no list, no submit, no wait
+    bool viewOn, shotOn;
+    {
+        std::lock_guard<std::mutex> lk(g_viewMx);
+        viewOn = g_viewOn;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_shotMx);
+        shotOn = (!g_shotPath.empty() && !g_shotBuf) || g_burstLeft > 0;
+    }
+    if (g_batch.empty() && !viewOn && !shotOn && !UiWantsDraw()) {
+        ++g_st.skipped;
+        return;
+    }
     static bool firstDraw = true;
     if (firstDraw) { firstDraw = false; Log("overlay: first draw (buffer %u)", idx); }
     // Make sure the allocator for this back buffer is no longer in use on the GPU before resetting it.
+    uint64_t tw = OvUs();
     if (g_fence->GetCompletedValue() < g_allocFence[idx]) {
         g_fence->SetEventOnCompletion(g_allocFence[idx], g_fenceEvent);
         WaitForSingleObject(g_fenceEvent, 2000);
     }
+    g_st.waitUs += OvUs() - tw;
+    if (g_qRead && idx < g_qPending.size() && g_qPending[idx]) {  // the GPU time of this buffer's last list
+        D3D12_RANGE r = {idx * 16ull, idx * 16ull + 16};
+        UINT64* ts = nullptr;
+        if (SUCCEEDED(g_qRead->Map(0, &r, reinterpret_cast<void**>(&ts))) && ts) {
+            UINT64 a = ts[idx * 2], b2 = ts[idx * 2 + 1];
+            if (b2 > a) {
+                g_st.gpuTicks += b2 - a;
+                g_st.gpuMaxTicks = (std::max)(g_st.gpuMaxTicks, static_cast<uint64_t>(b2 - a));
+                ++g_st.gpuFrames;
+            }
+            D3D12_RANGE none = {0, 0};
+            g_qRead->Unmap(0, &none);
+        }
+        g_qPending[idx] = false;
+    }
     g_alloc[idx]->Reset();
     g_cl->Reset(g_alloc[idx], g_ovPso);
+    if (g_qHeap) g_cl->EndQuery(g_qHeap, D3D12_QUERY_TYPE_TIMESTAMP, idx * 2);
 
     D3D12_RESOURCE_BARRIER b = {};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1086,20 +1263,15 @@ void OverlayDraw(IDXGISwapChain3* /*scProxy*/) {
     g_cl->SetDescriptorHeaps(1, heaps);
     g_cl->SetGraphicsRootSignature(g_ovRoot);
     g_cl->SetPipelineState(g_ovPso);
-    g_cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    g_cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
-    g_recording = true;  // primitives are valid now; each PushQuad binds its own SRV slot + constants
-    ViewDraw(idx);
-    for (auto& e : g_overlayDrawCbs) {
-        if (e.dead) continue;
-        DWORD code = 0;
-        if (!OverlayCbGuarded(e.cb, e.ctx, &code)) {
-            e.dead = true;
-            Log("overlay: draw callback %p dropped: exception 0x%08x", e.cb, code);
-        }
-    }
-    if (g_ovDraw) ApiDrawText(12.0f, 10.0f, 0xFFFFFFFFu, "TW3SE overlay");  // dev watermark (`overlaytest draw`)
+    g_recording = true;
+    uint64_t tq = OvUs();
+    ViewDraw(idx);  // (its copy and clear are recorded now, its quad goes under the collected ones)
     g_recording = false;
+    FlushQuads(idx);
+    uint64_t tu = OvUs();
+    g_st.drawUs += tu - tq;
     {  // the in-game UI last, on top (its backend binds its own pipeline; our heap stays bound)
         D3D12_CPU_DESCRIPTOR_HANDLE cpu = g_srvHeap->GetCPUDescriptorHandleForHeapStart();
         D3D12_GPU_DESCRIPTOR_HANDLE gpu = g_srvHeap->GetGPUDescriptorHandleForHeapStart();
@@ -1107,6 +1279,8 @@ void OverlayDraw(IDXGISwapChain3* /*scProxy*/) {
         gpu.ptr += static_cast<UINT64>(kUiFontSlot) * g_srvStride;
         UiRender(g_dev, g_queue, static_cast<int>(g_ovCount), g_ovFmt, g_srvHeap, cpu, gpu, g_cl);
     }
+    uint64_t ts0 = OvUs();
+    g_st.uiUs += ts0 - tu;
 
     bool shot = false;
     {
@@ -1202,12 +1376,18 @@ void OverlayDraw(IDXGISwapChain3* /*scProxy*/) {
     b.Transition.StateBefore = (shot || burst) ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_RENDER_TARGET;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
     g_cl->ResourceBarrier(1, &b);
+    if (g_qHeap) {
+        g_cl->EndQuery(g_qHeap, D3D12_QUERY_TYPE_TIMESTAMP, idx * 2 + 1);
+        g_cl->ResolveQueryData(g_qHeap, D3D12_QUERY_TYPE_TIMESTAMP, idx * 2, 2, g_qRead, idx * 16ull);
+        g_qPending[idx] = true;
+    }
     g_cl->Close();
 
     ID3D12CommandList* lists[] = {g_cl};
     g_queue->ExecuteCommandLists(1, lists);
     g_allocFence[idx] = ++g_fenceCtr;
     g_queue->Signal(g_fence, g_allocFence[idx]);
+    g_st.submitUs += OvUs() - ts0;
     if (shot) g_shotFence = g_allocFence[idx];
     if (burst) {
         std::lock_guard<std::mutex> lk(g_shotMx);
@@ -1398,8 +1578,17 @@ void OverlayPresentCb(void* swapChain, void* /*ctx*/) {
     // blind crash; a hard access violation is caught by the SEH present guard.
     g_ovWhy = wantDraw ? "draws" : "ready, nothing to draw";
     if (wantDraw) {
+        uint64_t t0 = OvUs();
+        g_frameQuads = 0, g_frameDraws = 0;
         OverlayDraw(sc);
-        if (g_dev) {
+        uint64_t dt = OvUs() - t0;
+        ++g_st.frames;
+        g_st.totalUs += dt;
+        g_st.maxUs = (std::max)(g_st.maxUs, dt);
+        g_st.quads += g_frameQuads;
+        g_st.draws += g_frameDraws;
+        static unsigned checks = 0;
+        if (g_dev && ++checks % 120 == 0) {  // (a call into the driver: every 120 frames is soon enough)
             HRESULT rr = g_dev->GetDeviceRemovedReason();
             if (rr != S_OK) {
                 Log("overlay draw: device removed 0x%08x - disabling overlay", rr);
@@ -1429,6 +1618,31 @@ void CmdUiShot(const char* args, char* reply, uint32_t size) {
     }
     for (int i = 0; i < 100 && g_shotDone.load() == before; ++i) Sleep(20);  // a few frames and the encoding
     snprintf(reply, size, g_shotDone.load() != before ? "uishot: %s" : "uishot: asked for %s (see tw3se.log)", path.c_str());
+}
+
+// `overlaystats [reset]`: the overlay's cost per drawn frame since the last reset - the present thread (all, waiting
+// for its own last list, the plugins' and Lua's primitives, the in-game UI, recording the end and submitting), the
+// quads, the GPU time of its list, and the main thread's ImGui frames (built and copied for the render thread)
+void CmdOverlayStats(const char* arg, char* reply, uint32_t size) {
+    bool reset = arg && strstr(arg, "reset");
+    OvStats st = g_st;
+    uint64_t uf = 0, uus = 0, upub = 0;
+    UiFrameTimes(&uf, &uus, &upub, reset);
+    double n = st.frames ? static_cast<double>(st.frames) : 1.0, un = uf ? static_cast<double>(uf) : 1.0;
+    double gpu = st.gpuFrames && g_tsFreq ? st.gpuTicks * 1000.0 / g_tsFreq / st.gpuFrames : -1.0;
+    double gpuMax = g_tsFreq ? st.gpuMaxTicks * 1000.0 / g_tsFreq : -1.0;
+    snprintf(reply, size,
+             "overlay: %llu frames (%llu with nothing drawn) | present thread %.3f ms/frame (max %.3f): wait %.3f, "
+             "primitives %.3f (%.0f quads in %.1f draws), UI %.3f, end+submit %.3f | GPU %.3f ms/frame (max %.3f, %llu "
+             "frames) | main thread ImGui %.3f ms/frame (copy %.3f, %llu frames) | %s",
+             static_cast<unsigned long long>(st.frames), static_cast<unsigned long long>(st.skipped),
+             st.totalUs / n / 1000.0, st.maxUs / 1000.0, st.waitUs / n / 1000.0, st.drawUs / n / 1000.0, st.quads / n,
+             st.draws / n, st.uiUs / n / 1000.0,
+             st.submitUs / n / 1000.0, gpu, gpuMax, static_cast<unsigned long long>(st.gpuFrames), uus / un / 1000.0,
+             upub / un / 1000.0, static_cast<unsigned long long>(uf), g_ovWhy.load());
+    size_t used = strlen(reply);
+    if (used + 2 < size) snprintf(reply + used, size - used, " | %s", StreamlineTagStats().c_str());
+    if (reset) g_st = OvStats();
 }
 
 void CmdOverlayTest(const char* arg, char* reply, uint32_t size) {
@@ -1527,6 +1741,7 @@ bool InstallOverlay(bool needed) {
     if (!command) {  // the console command is there either way: `overlaytest on` installs the hook
         command = true;
         RegisterCommand("overlaytest", &CmdOverlayTest, "overlaytest on|draw|off: on=init only, draw=dev watermark");
+        RegisterCommand("overlaystats", &CmdOverlayStats, "overlaystats [reset]: the overlay's cost per frame (present thread by part, quads, GPU, the UI's main-thread frames)");
         RegisterCommand("uishot", &CmdUiShot, "uishot <file.png>: the game's picture with the overlay and the UI");
     }
     if (installed) return hooked;
