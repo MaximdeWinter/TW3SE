@@ -1,0 +1,28 @@
+#include <winver.h>
+
+#define CC_VERSION 1, 3, 1, 0
+#define CC_VERSION_STR "1.3.1"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION CC_VERSION
+PRODUCTVERSION CC_VERSION
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription", "crashcatch: writes a crash report with minidumps when a game crashes"
+            VALUE "FileVersion", CC_VERSION_STR
+            VALUE "InternalName", "crashcatch"
+            VALUE "OriginalFilename", "crashcatch.exe"
+            VALUE "ProductName", "crashcatch"
+            VALUE "ProductVersion", CC_VERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

@@ -1,0 +1,4 @@
+witcher3.exe+0x209e18a | A crash seconds after a scene's end: a Lua mod handed an AI action to the game, TW3SE freed it while the game still used it. Fixed in TW3SE 1.3.2.
+witcher3.exe+0x24a0760 | A crash seconds after a scene's end (same cause as witcher3.exe+0x209e18a: an AI action freed while the game still used it). Fixed in TW3SE 1.3.2.
+witcher3.exe+0xfcb137 | The game asked for memory and got none (out of memory). A larger page file helps (Windows: page file size managed by the system).
+function at +0x1ec5860 | A crash right after Frame Generation (FSR or XeSS) was switched on or off in the options, also in the main menu: TW3SE's overlay still held the game's old swap chain. Fixed in TW3SE 1.3.3 (the build of 11.11. or newer). Until then: overlay = off in tw3se.config.

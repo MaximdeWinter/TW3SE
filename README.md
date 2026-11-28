@@ -27,6 +27,16 @@ python tools\nexus_zip.py     the two zips in build\nexus\<version>
 - `lua`: the Lua library, examples, the mod template and the tests
 - `plugins`: example and test plugins
 - `docs\manual`, `docs\LUA.md`: the manual
+- `crashcatch`: crashcatch, the crash reporter for players (`crashcatch\README.md`)
+
+## crashcatch
+
+crashcatch writes a report with minidumps when The Witcher 3 crashes. Players start it before the game and send the
+zip it leaves. The ready program is under Releases.
+
+```
+crashcatch\build.bat          crashcatch\build\crashcatch.exe
+```
 
 ## License
 

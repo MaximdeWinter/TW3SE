@@ -1,0 +1,16 @@
+crashcatch saves a report when the game crashes, or when something looks wrong and you press Ctrl+F12.
+
+1. Unpack this zip into any folder.
+2. Start crashcatch.exe and leave its window open.
+3. Start the game as usual and play.
+
+If the game crashes, crashcatch shows you one file. Send that file. It is already copied: paste it with Ctrl+V into
+Discord, a forum post or a mail.
+
+Something looks wrong, but the game goes on? Press Ctrl+F12 in the game while it is on screen. A window asks what is
+wrong: write a sentence and click Save the report. crashcatch shows you the file to send, and the game goes on.
+(D in the crashcatch window does the same.)
+
+If the game runs as administrator, start crashcatch as administrator too.
+
+If you are asked for deep mode: start deep.bat (in the same folder) and play as usual.
